@@ -1,8 +1,8 @@
 # Agentrix
 
-> A Go-native Agent Application Framework built on Eino Graph.
+A Go-native Agent Application Framework built on Eino Graph.
 
-Agentrix 是一个产品级 Agent 应用框架，底层基于 [Eino Graph](https://github.com/cloudwego/eino)，
+Agentrix 是一个产品级 Agent 应用框架，底层基于 Eino Graph，
 提供上下文管理、模型决策循环、工具执行、会话持久化、HITL、Signal/Artifact 等能力。
 
 ## 特性
@@ -19,8 +19,10 @@ Agentrix 是一个产品级 Agent 应用框架，底层基于 [Eino Graph](https
 ```bash
 go mod init github.com/daqiaoliang-coder/agentrix
 go get github.com/cloudwego/eino
+go mod tidy
 go run examples/echo_scene/main.go
 ```
 
-License
+## License
+
 MIT
