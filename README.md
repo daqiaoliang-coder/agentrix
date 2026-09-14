@@ -20,5 +20,6 @@ Agentrix 是一个产品级 Agent 应用框架，底层基于 [Eino Graph](https
 go mod init github.com/daqiaoliang-coder/agentrix
 go get github.com/cloudwego/eino
 go run examples/echo_scene/main.go
-License
+
+## License
 MIT
