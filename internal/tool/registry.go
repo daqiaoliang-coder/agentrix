@@ -3,6 +3,7 @@ package tool
 import "github.com/cloudwego/eino/components/tool"
 
 type Registry struct {
+	// 工具应该遵循最佳实践：语义单一、参数扁平化、优先批量、计算在工具侧、支持部分失败。
 	tools map[string]tool.BaseTool
 }
 
