@@ -16,6 +16,8 @@ const (
 	ContextCompacted SignalType = "context_compacted"
 )
 
+// Signal 是运行事实，不是 UI 文案，也不是模型上下文。它的目标是让外层系统观察 Agent 正在发生什么。
+// 事件来源三条路径：Turn 生命周期、模型回调、工具和 middleware。
 type Signal struct {
 	ID             string     `json:"id"`
 	TS             time.Time  `json:"ts"`
