@@ -1,0 +1,5 @@
+name: summarize
+description: |
+  当用户要求总结、概括、提炼对话内容时使用此技能。
+  触发关键词：总结、概括、提炼、摘要、summarize、summary。
+  仅当对话历史超过 10 轮或用户明确要求时激活。

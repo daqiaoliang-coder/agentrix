@@ -23,9 +23,14 @@ func BuildAgentGraph(
 		return nil, fmt.Errorf("add model node: %w", err)
 	}
 
-	if err := g.AddToolsNode("tools", &compose.ToolsNodeConfig{
+	toolsNode, err := compose.NewToolNode(ctx, &compose.ToolsNodeConfig{
 		Tools: tools,
-	}); err != nil {
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create tools node: %w", err)
+	}
+
+	if err := g.AddToolsNode("tools", toolsNode); err != nil {
 		return nil, fmt.Errorf("add tools node: %w", err)
 	}
 
