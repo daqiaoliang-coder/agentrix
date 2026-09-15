@@ -6,6 +6,7 @@ import (
 
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
+	"github.com/daqiaoliang-coder/agentrix/internal/harness/hitl"
 
 	"github.com/daqiaoliang-coder/agentrix/internal/scene"
 	"github.com/daqiaoliang-coder/agentrix/internal/session"
@@ -70,6 +71,17 @@ func (a *Agent) Run(
 	}
 
 	return output, nil
+}
+
+// Resume 从 HITL 中断点恢复执行
+func (a *Agent) Resume(
+	ctx context.Context,
+	sessionID string,
+	interruptID string,
+	decision *hitl.ApprovalDecision,
+) (*schema.Message, error) {
+	resumeCtx := hitl.ResumeWithDecision(ctx, interruptID, decision)
+	return a.Run(resumeCtx, sessionID, "")
 }
 
 func (a *Agent) assembleContext(state *session.State, history []*schema.Message, userInput string) []*schema.Message {

@@ -8,6 +8,7 @@ import (
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
+	"github.com/daqiaoliang-coder/agentrix/internal/harness/hitl"
 )
 
 // BuildAgentGraph 构建 ReAct 循环图
@@ -74,10 +75,13 @@ func BuildAgentGraph(
 		maxIterations = 8
 	}
 
+	store := hitl.NewMemoryCheckPointStore()
+
 	// ⑥ 编译：有环图必须设置 MaxRunSteps 防止无限循环
 	runnable, err := graph.Compile(ctx,
 		compose.WithMaxRunSteps(maxIterations*2+2), // 每轮约 2 步
 		compose.WithNodeTriggerMode(compose.AnyPredecessor),
+		compose.WithCheckPointStore(store), // 检查点
 	)
 	if err != nil {
 		return nil, fmt.Errorf("compile graph: %w", err)
