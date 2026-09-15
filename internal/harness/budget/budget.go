@@ -2,6 +2,7 @@ package budget
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -13,6 +14,9 @@ type TokenUsage struct {
 	CompletionTokens int
 	TotalTokens      int
 }
+
+// ErrBudgetExhausted 是预算耗尽的哨兵错误，调用方可据此区分终止原因。
+var ErrBudgetExhausted = errors.New("budget exhausted")
 
 // Budget 跟踪单个 Turn 的 token 和迭代预算
 type Budget struct {
@@ -26,6 +30,9 @@ type Budget struct {
 
 	StartTime time.Time
 	Deadline  time.Time // 超时预算，零值表示不限制
+
+	// progressSig 记录最近若干轮工具调用签名，供 IsStagnant 无进展检测使用
+	progressSig []string
 }
 
 // NewBudget 创建预算控制器
@@ -82,6 +89,56 @@ func (b *Budget) CheckDeadline() error {
 		return fmt.Errorf("budget deadline exceeded at %s", b.Deadline)
 	}
 	return nil
+}
+
+// IsExhausted 判断 token 或迭代预算是否已耗尽（任一超限即 true）。
+// 这是 Generate 前的快速短路检查，避免在预算已尽时仍发起模型调用。
+func (b *Budget) IsExhausted() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.MaxTokens > 0 && b.UsedTokens > b.MaxTokens {
+		return true
+	}
+	if b.MaxIterations > 0 && b.UsedIterations > b.MaxIterations {
+		return true
+	}
+	return false
+}
+
+// progressSignatures 维护最近若干轮工具调用签名，用于无进展检测。
+// 长度上限通过 progressWindow 控制。
+const progressWindow = 8
+
+// RecordProgress 记录本轮的工具调用签名（例如 ToolCalls 名称与参数的哈希）。
+// 签名相同表示模型在重复同样的工具调用，触发 IsStagnant 后可注入收尾提示。
+func (b *Budget) RecordProgress(signature string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.progressSig = append(b.progressSig, signature)
+	if len(b.progressSig) > progressWindow {
+		b.progressSig = b.progressSig[len(b.progressSig)-progressWindow:]
+	}
+}
+
+// IsStagnant 判断是否连续 limit 轮无进展（签名完全相同）。
+// limit <= 0 表示禁用无进展检测。
+func (b *Budget) IsStagnant(limit int) bool {
+	if limit <= 0 {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.progressSig) < limit {
+		return false
+	}
+	tail := b.progressSig[len(b.progressSig)-limit:]
+	first := tail[0]
+	for _, s := range tail[1:] {
+		if s != first {
+			return false
+		}
+	}
+	return true
 }
 
 // Remaining 返回剩余 token 预算

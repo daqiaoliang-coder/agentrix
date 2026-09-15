@@ -32,13 +32,16 @@ func (BaseMiddleware) AfterAgent(_ context.Context, _ *AgentState, _ *schema.Mes
 func (BaseMiddleware) BeforeModel(ctx context.Context, _ *AgentState) (context.Context, error) { return ctx, nil }
 func (BaseMiddleware) AfterModel(_ context.Context, _ *AgentState, _ *schema.Message) error { return nil }
 
+// BudgetMiddleware 已被 BudgetModel 装饰器取代，当前未接入 Graph。
+// 装饰器在每次模型调用处统一处理预算检查 / 超时 / 重试 / 用量记录 / 无进展，
+// 比中间件更贴近 eino 图运行时。保留本类型作为未来若需独立中间件链的参考实现。
 type BudgetMiddleware struct{ BaseMiddleware }
 
 func (BudgetMiddleware) Name() string { return "budget" }
 
-func (BudgetMiddleware) BeforeModel(_ context.Context, state *AgentState) (context.Context, error) {
+func (BudgetMiddleware) BeforeModel(ctx context.Context, state *AgentState) (context.Context, error) {
 	if state.Budget == nil {
-		return nil, nil
+		return ctx, nil
 	}
 	if err := state.Budget.CheckDeadline(); err != nil {
 		return nil, err
@@ -46,7 +49,22 @@ func (BudgetMiddleware) BeforeModel(_ context.Context, state *AgentState) (conte
 	if err := state.Budget.NextIteration(); err != nil {
 		return nil, err
 	}
-	return nil, nil
+	return ctx, nil
+}
+
+func (BudgetMiddleware) AfterModel(_ context.Context, state *AgentState, output *schema.Message) error {
+	if state.Budget == nil || output == nil {
+		return nil
+	}
+	// 从模型输出提取用量消费预算；ResponseMeta 缺失时跳过（装饰器有估算兜底）
+	if output.ResponseMeta != nil && output.ResponseMeta.Usage != nil {
+		_ = state.Budget.ConsumeTokens(budget.TokenUsage{
+			PromptTokens:     output.ResponseMeta.Usage.PromptTokens,
+			CompletionTokens: output.ResponseMeta.Usage.CompletionTokens,
+			TotalTokens:      output.ResponseMeta.Usage.TotalTokens,
+		})
+	}
+	return nil
 }
 
 type TraceMiddleware struct {

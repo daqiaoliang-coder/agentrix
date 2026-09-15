@@ -48,6 +48,16 @@ func NewEngineWithModel(m model.BaseChatModel) *Engine {
 	return e
 }
 
+// CompressInPlace 对消息序列做规则压缩（工具输出裁剪 + 工具调用对修复），
+// 不调用 LLM、不需要 session.State，适合在模型调用前对上下文做轻量维护。
+// 保留最近 trimKeepRecentTools 条工具消息原文，较早的替换为占位符。
+// 这是 Agent.Run 级 Assemble（含 LLM 摘要）的补充：循环内每轮只做规则裁剪，
+// 避免工具输出原样累积污染上下文。
+func (e *Engine) CompressInPlace(messages []*schema.Message) []*schema.Message {
+	trimmed := trimToolOutputs(messages, trimKeepRecentTools)
+	return fixToolCallPairs(trimmed)
+}
+
 // Assemble 装配模型可见上下文，必要时触发压缩
 func (e *Engine) Assemble(
 	ctx context.Context,

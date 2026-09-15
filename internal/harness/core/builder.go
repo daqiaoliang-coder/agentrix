@@ -49,6 +49,11 @@ func BuildAgentGraph(
 	}
 
 	// ③ 添加工具执行节点
+	//
+	// 设计决策（建议#5 工具结果标准化）：eino 的 ToolsNode 内部并发执行工具并独立处理
+	// 单个工具失败（部分失败不阻断整体），已覆盖「结构化成功+失败信息」的核心诉求。
+	// 若需为单个工具调用施加 context.WithTimeout，需包装每个 tool.BaseTool；
+	// 当前 ROI 不足，暂不实现，留作后续增强。
 	if err := graph.AddToolsNode("tools", toolsNode); err != nil {
 		return nil, fmt.Errorf("add tools node: %w", err)
 	}
