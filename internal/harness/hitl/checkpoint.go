@@ -22,6 +22,26 @@ func NewMemoryCheckPointStore() *MemoryCheckPointStore {
 	return &MemoryCheckPointStore{store: make(map[string][]byte)}
 }
 
+// DefaultCheckPointStore 返回进程级共享的检查点存储。
+//
+// 为什么必须共享：Agent 是无状态执行器，上层（HTTP handler）每次请求都重新
+// NewAgent → BuildAgentGraph。若每次建图都新建存储，审批中断时写入的
+// Checkpoint 会在恢复请求到来前随旧图一起被丢弃，Resume 必然失败。
+//
+// 生产环境应替换为持久化实现（DB/Redis）以支持多副本部署；
+// 内存版仅适用于单进程。
+var (
+	defaultStoreOnce sync.Once
+	defaultStore     *MemoryCheckPointStore
+)
+
+func DefaultCheckPointStore() *MemoryCheckPointStore {
+	defaultStoreOnce.Do(func() {
+		defaultStore = NewMemoryCheckPointStore()
+	})
+	return defaultStore
+}
+
 func (s *MemoryCheckPointStore) Get(_ context.Context, checkPointID string) ([]byte, bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

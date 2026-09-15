@@ -177,6 +177,35 @@ func (m *BudgetModel) Stream(
 
 // WithTools 实现 model.ToolCallingChatModel.WithTools。
 // 必须返回新的装饰器包装派生后的模型，否则预算/超时/重试能力会静默丢失。
+//
+// # 对被包装模型实现的契约要求（重要）
+//
+// eino 在 ReAct 循环中绑定工具时会调用本方法，而本方法会把调用透传给
+// m.raw.WithTools —— 即每一轮模型调用都可能产生一个派生实例。因此：
+//
+//	任何自定义 ToolCallingChatModel 实现，其 WithTools 返回的派生实例
+//	必须与原实例「共享」可变运行状态（轮次计数、调用计数、缓存、
+//	会话游标等），而不能各自持有独立副本。
+//
+// 违反该契约的后果是状态被静默重置：派生实例的计数器从零开始，
+// 表现为按轮次推进的逻辑从头重放、统计值丢失、行为随迭代轮数漂移。
+// 这类故障不报错、不 panic，只在多轮场景下显现，定位成本很高。
+//
+// 正确做法是让状态位于指针之后，由所有派生实例共享，例如：
+//
+//	type myModel struct{ state *myState }   // 指针共享
+//	func (m *myModel) WithTools(tools []*schema.ToolInfo) (model.ToolCallingChatModel, error) {
+//	    clone := &myModel{state: m.state}    // 共享同一 state，勿值拷贝
+//	    clone.boundTools = tools
+//	    return clone, nil
+//	}
+//
+// 反例（状态随克隆丢失）：
+//
+//	clone := *m                              // 值拷贝，计数器被复制成独立副本
+//
+// 参见 examples/release_scene/main_test.go 中 scriptModel 的实现，
+// 它以 *scriptState 指针共享轮次计数，正是为满足本契约。
 func (m *BudgetModel) WithTools(tools []*schema.ToolInfo) (model.ToolCallingChatModel, error) {
 	derived, err := m.raw.WithTools(tools)
 	if err != nil {

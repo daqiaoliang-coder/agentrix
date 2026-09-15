@@ -7,7 +7,7 @@ import (
 	"os"
 	"time"
 
-	openai "github.com/cloudwego/eino-ext/components/model/openai"
+	"github.com/cloudwego/eino-ext/components/model/openai"
 
 	"github.com/daqiaoliang-coder/agentrix/internal/harness/core"
 	"github.com/daqiaoliang-coder/agentrix/internal/scene"

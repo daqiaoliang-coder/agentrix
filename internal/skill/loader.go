@@ -28,22 +28,58 @@ func (l *Loader) Register(s *Skill) {
 	l.skills[s.Name] = s
 }
 
-// Frontmatter 返回轻量入口（name + description），始终在上下文中
+// Frontmatter 返回轻量入口（name + description），始终在上下文中。
+// 对应渐进式加载阶段 0：只暴露"有哪些技能、各自做什么"，不含正文与细则。
 func (l *Loader) Frontmatter() []*schema.Message {
 	msgs := make([]*schema.Message, 0, len(l.skills))
 	for _, s := range l.skills {
 		msgs = append(msgs, schema.SystemMessage(
-			fmt.Sprintf("可用技能: %s - %s", s.Name, s.Description),
+			fmt.Sprintf("- %s：%s", s.Name, s.Description),
 		))
 	}
 	return msgs
 }
 
-// LoadBody 按需加载 Skill 正文
+// LoadBody 按需加载 Skill 正文（阶段 1：模型选中 Skill 后读取入口文档）
 func (l *Loader) LoadBody(name string) (string, error) {
 	s, ok := l.skills[name]
 	if !ok {
 		return "", fmt.Errorf("skill %s not found", name)
 	}
 	return s.Body, nil
+}
+
+// LoadReference 按需加载某个 Skill 下指定的 reference 文档（阶段 2：模型据操作类型读取完整命令契约）
+func (l *Loader) LoadReference(name, ref string) (string, error) {
+	s, ok := l.skills[name]
+	if !ok {
+		return "", fmt.Errorf("skill %s not found", name)
+	}
+	body, ok := s.References[ref]
+	if !ok {
+		return "", fmt.Errorf("reference %s not found in skill %s", ref, name)
+	}
+	return body, nil
+}
+
+// Names 返回所有已注册 Skill 名称，供读取工具在名称错误时给出可用清单
+func (l *Loader) Names() []string {
+	names := make([]string, 0, len(l.skills))
+	for n := range l.skills {
+		names = append(names, n)
+	}
+	return names
+}
+
+// ReferenceNames 返回某个 Skill 下的全部 reference 名称
+func (l *Loader) ReferenceNames(name string) ([]string, error) {
+	s, ok := l.skills[name]
+	if !ok {
+		return nil, fmt.Errorf("skill %s not found", name)
+	}
+	refs := make([]string, 0, len(s.References))
+	for r := range s.References {
+		refs = append(refs, r)
+	}
+	return refs, nil
 }

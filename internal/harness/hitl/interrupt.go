@@ -15,6 +15,19 @@ import (
 // compose.Resume	隐式恢复所有中断点
 // compose.GetResumeContext[T]	在恢复的组件中获取 Resume 数据
 
+func init() {
+	// 写入 Checkpoint 的类型必须先向 eino 序列化器注册，否则中断时报
+	// "failed to set checkpoint: unknown type"，整个审批链路无法工作。
+	//
+	// 注册对象覆盖三类：
+	//   - ApprovalState：StatefulInterrupt 持久化的组件内部状态（必须注册）
+	//   - ApprovalRequest：随中断冒泡到上层的展示信息
+	//   - ApprovalDecision：恢复时通过 ResumeWithData 注入的决策
+	schema.RegisterName[*ApprovalState]("agentrix_hitl_approval_state")
+	schema.RegisterName[*ApprovalRequest]("agentrix_hitl_approval_request")
+	schema.RegisterName[*ApprovalDecision]("agentrix_hitl_approval_decision")
+}
+
 // ApprovalRequest 是中断时传给外部系统的信息
 type ApprovalRequest struct {
 	ToolName  string    `json:"tool_name"`

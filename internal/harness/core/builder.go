@@ -80,7 +80,9 @@ func BuildAgentGraph(
 		maxIterations = 8
 	}
 
-	store := hitl.NewMemoryCheckPointStore()
+	// 检查点存储必须进程级共享：Agent 每次请求重建，若每次新建存储，
+	// 审批中断写入的 Checkpoint 会随旧图丢弃，Resume 必然失败。
+	store := hitl.DefaultCheckPointStore()
 
 	// ⑥ 编译：有环图必须设置 MaxRunSteps 防止无限循环
 	runnable, err := graph.Compile(ctx,
