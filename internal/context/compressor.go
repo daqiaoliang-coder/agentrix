@@ -20,8 +20,8 @@ func (c *Compressor) Compress(
 	prevSummary string,
 ) (result []*schema.Message, summary string, err error) {
 
-	trimmed := trimToolOutputs(messages, trimKeepRecentTools)
-	head, middle, tail := splitByBoundary(trimmed, c.Engine.TailTokenBudget)
+	trimmed := c.Engine.evictToolResults(ctx, messages, trimKeepRecentTools, c.Engine.lowWater())
+	head, middle, tail := splitByBoundary(trimmed, c.Engine.tailBudget())
 	if len(middle) == 0 {
 		return fixToolCallPairs(trimmed), prevSummary, nil
 	}

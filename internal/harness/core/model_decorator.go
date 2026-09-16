@@ -80,9 +80,9 @@ func (m *BudgetModel) Generate(
 		input = append(append([]*schema.Message(nil), input...), nudge)
 	}
 
-	// ③ 上下文循环内压缩（规则裁剪，不调 LLM）
+	// ③ 上下文循环内压缩（规则裁剪，不调 LLM；仅越 softLimit 才触发）
 	if m.cfg.Engine != nil {
-		input = m.cfg.Engine.CompressInPlace(input)
+		input = m.cfg.Engine.CompressInPlace(ctx, input)
 	}
 
 	// ④ 带重试的模型调用
@@ -170,7 +170,7 @@ func (m *BudgetModel) Stream(
 ) (*schema.StreamReader[*schema.Message], error) {
 
 	if m.cfg.Engine != nil {
-		input = m.cfg.Engine.CompressInPlace(input)
+		input = m.cfg.Engine.CompressInPlace(ctx, input)
 	}
 	return m.raw.Stream(ctx, input, opts...)
 }

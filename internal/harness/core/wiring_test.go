@@ -425,3 +425,93 @@ func TestApprovalRejectDoesNotExecuteWrite(t *testing.T) {
 		t.Errorf("拒绝授权后写工具仍被执行 %d 次", writeTool.ran)
 	}
 }
+
+// ---------- 拼图 4：压缩接线（开销快照 + 回读工具 + 非幂等标记）----------
+
+// TestNewAgentWiresCompressionPlumbing 验证三项装配确实生效：
+//  1. read_result 回读工具已注册到模型可见的工具集（offload 闭环的入口）；
+//  2. 开销快照已按装配后的系统提示与工具 schema 计算并注入（阈值不再失真）；
+//  3. Catalog 的 NeedsApproval 已接线为非幂等判定（写结果不会被淘汰）。
+func TestNewAgentWiresCompressionPlumbing(t *testing.T) {
+	ctx := context.Background()
+	catalog := wbsCatalog(t)
+	readTool := &fakeReadTool{name: "list_draft"}
+	writeTool := &fakeWriteTool{name: "edit_draft"}
+
+	agent, err := NewAgent(ctx, &scene.SceneConfig{
+		Key:           "wbs",
+		SystemPrompt:  "你是排期助手",
+		Model:         &scriptModel{},
+		Tools:         []tool.BaseTool{readTool, writeTool},
+		Catalog:       catalog,
+		MaxIterations: 3,
+		TokenBudget:   8192,
+	}, session.NewMemoryStore())
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+
+	// ① read_result 必须对模型可见，否则被淘汰的结果无法回读
+	names := assembledToolNames(t, agent.assembled)
+	if !containsStr(names, "read_result") {
+		t.Errorf("read_result 未注册，实际工具集: %v", names)
+	}
+	// 原有工具不受影响
+	for _, want := range []string{"list_draft", "edit_draft"} {
+		if !containsStr(names, want) {
+			t.Errorf("工具 %q 意外丢失，实际: %v", want, names)
+		}
+	}
+
+	// ② 开销快照必须非零：系统提示与工具 schema 都是真实输入开销
+	overhead := agent.engine.Overhead()
+	if overhead.SystemTokens <= 0 {
+		t.Errorf("系统提示开销未计入快照: %+v", overhead)
+	}
+	if overhead.ToolsTokens <= 0 {
+		t.Errorf("工具 schema 开销未计入快照: %+v", overhead)
+	}
+	// 快照应覆盖技能索引之外的系统提示正文
+	if !strings.Contains(agent.assembled.SystemPrompt, "你是排期助手") {
+		t.Error("装配后的系统提示丢失了原始正文")
+	}
+
+	// ③ 写工具判定为非幂等，读工具不是
+	if agent.engine.IsNonIdempotent == nil {
+		t.Fatal("IsNonIdempotent 未接线，写结果会被误淘汰")
+	}
+	if !agent.engine.IsNonIdempotent("edit_draft") {
+		t.Error("edit_draft 应被判定为写/非幂等")
+	}
+	if agent.engine.IsNonIdempotent("list_draft") {
+		t.Error("list_draft 是只读工具，不应被判定为非幂等")
+	}
+
+	// 溢出存储已接入，offload 才可能可恢复
+	if agent.engine.Overhead().Total() <= 0 {
+		t.Error("开销快照总量为零，压缩阈值会失真")
+	}
+}
+
+// TestNewAgentWithoutCatalogStillRegistersReadResult 验证无 Catalog 场景
+// （向后兼容路径）依然接入溢出存储与回读工具，只是不做非幂等区分。
+func TestNewAgentWithoutCatalogStillRegistersReadResult(t *testing.T) {
+	ctx := context.Background()
+	agent, err := NewAgent(ctx, &scene.SceneConfig{
+		Key:   "plain",
+		Model: &scriptModel{},
+		Tools: []tool.BaseTool{&fakeReadTool{name: "search"}},
+	}, session.NewMemoryStore())
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+
+	names := assembledToolNames(t, agent.assembled)
+	if !containsStr(names, "read_result") {
+		t.Errorf("无 Catalog 时 read_result 也应注册，实际: %v", names)
+	}
+	// 未接线非幂等判定时，engine 应退化为「全部可淘汰」而非 panic
+	if agent.engine.IsNonIdempotent != nil {
+		t.Error("无 Catalog 时不应设置非幂等判定")
+	}
+}

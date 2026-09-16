@@ -2,8 +2,10 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
+	einotool "github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
 
@@ -12,6 +14,7 @@ import (
 	"github.com/daqiaoliang-coder/agentrix/internal/harness/hitl"
 	"github.com/daqiaoliang-coder/agentrix/internal/scene"
 	"github.com/daqiaoliang-coder/agentrix/internal/session"
+	"github.com/daqiaoliang-coder/agentrix/internal/tool/builtin"
 )
 
 // Agent 是无状态的执行器，每次请求重新装配
@@ -42,27 +45,86 @@ func NewAgent(
 		engine.CompressThreshold = cfg.CompressThreshold
 	}
 
+	// 场景装配：注入技能索引（阶段 0）→ 审批包装（HITL）→ 命令白名单过滤（Catalog）
+	// 必须先于开销快照计算：快照要基于装配后的真实系统提示与最终工具集。
+	assembled, err := cfg.Assemble(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("assemble scene: %w", err)
+	}
+
+	// 溢出存储：承接被压缩淘汰的工具结果原文，使淘汰「可恢复」而非「删除」。
+	// 进程内实现，作用域为单个 Agent 实例（即单次 Turn 的 ReAct 循环）；
+	// 生产环境可替换为对象存储实现以支持跨 Turn 回读。
+	spill := ctxengine.NewMemorySpillStore()
+	engine.SetSpillStore(spill)
+
+	// 回读工具：与淘汰逻辑闭环。模型看到 stub 后可凭 tool_call_id 取回原文。
+	// 作为框架工具追加，不经 Catalog 白名单过滤（与 read_skill 同等待遇）。
+	assembled.Tools = append(assembled.Tools, builtin.NewReadResultTool(spill, readResultMaxChars))
+
+	// 写/非幂等工具标记：复用 Catalog 的 NeedsApproval（写类命令）作为判定依据。
+	// 这类工具结果无法重放，淘汰即永久丢失，故排除在淘汰之外。
+	if catalog := cfg.Catalog; catalog != nil {
+		engine.IsNonIdempotent = func(toolName string) bool {
+			spec, ok := catalog.SpecOf(toolName)
+			return ok && spec.NeedsApproval
+		}
+	}
+
+	// 固定开销快照：system prompt + 活跃工具 schema。这两块是模型每次调用都要付、
+	// 却不在 messages 列表里的真实输入；漏算会让压缩阈值失真、触发过晚。
+	// 由装配层（此处）计算并注入，engine 只消费快照，不反向依赖工具注册表。
+	engine.SetOverhead(computeOverhead(ctx, assembled.SystemPrompt, assembled.Tools))
+
 	// 用 BudgetModel 装饰器包装原始模型：双层超时 / 重试降级 / 预算 / 无进展 / 循环内压缩
 	decorated := NewBudgetModel(cfg.Model, BudgetModelConfig{
 		CallTimeout:     cfg.ModelCallTimeout,
-		MaxRetries:      3, // 默认重试上限，可按场景覆盖
+		MaxRetries:      3,                        // 默认重试上限，可按场景覆盖
 		Backoff:         cfg.ModelCallTimeout / 2, // 退避基数与调用超时联动
 		NoProgressLimit: cfg.NoProgressLimit,
 		FallbackModel:   cfg.FallbackModel,
 		Engine:          engine,
 	})
 
-	// 场景装配：注入技能索引（阶段 0）→ 审批包装（HITL）→ 命令白名单过滤（Catalog）
-	assembled, err := cfg.Assemble(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("assemble scene: %w", err)
-	}
-
 	r, err := BuildAgentGraph(ctx, decorated, assembled.Tools, cfg.MaxIterations)
 	if err != nil {
 		return nil, fmt.Errorf("build graph: %w", err)
 	}
 	return &Agent{cfg: cfg, runnable: r, store: store, engine: engine, assembled: assembled}, nil
+}
+
+// readResultMaxChars 是 read_result 单次回读的字符上限，防止一条超大结果回读后
+// 又把上下文顶爆（对应设计中的「read_result 页上限」）。约 25k token（2 字符/token）。
+const readResultMaxChars = 50000
+
+// computeOverhead 计算固定开销快照。
+// 工具 schema 用 Info() 的 JSON 序列化长度估算，与消息体共用同一套粗略 token 估算
+// （estimateTextLen，约 2 字符/token）。该估算对 ASCII 偏保守（高估），
+// 生产环境建议替换为 tiktoken 精确计量。
+func computeOverhead(
+	ctx context.Context,
+	systemPrompt string,
+	tools []einotool.BaseTool,
+) ctxengine.PromptOverheadSnapshot {
+	snap := ctxengine.PromptOverheadSnapshot{
+		SystemTokens: estimateTextLen(systemPrompt),
+	}
+	for _, t := range tools {
+		if t == nil {
+			continue
+		}
+		info, err := t.Info(ctx)
+		if err != nil || info == nil {
+			continue
+		}
+		if raw, mErr := json.Marshal(info); mErr == nil {
+			snap.ToolsTokens += estimateTextLen(string(raw))
+		} else {
+			// 序列化失败时退化为按名称+描述估算，不阻断装配
+			snap.ToolsTokens += estimateTextLen(info.Name) + estimateTextLen(info.Desc)
+		}
+	}
+	return snap
 }
 
 // Run 执行一次 Turn
