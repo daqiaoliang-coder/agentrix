@@ -3,7 +3,7 @@
 *.dll
 *.so
 *.dylib
-agentrix
+/agentrix
 *.test
 *.out
 /vendor/
