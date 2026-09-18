@@ -27,10 +27,18 @@ type AgentState struct {
 type BaseMiddleware struct{}
 
 func (BaseMiddleware) Name() string { return "base" }
-func (BaseMiddleware) BeforeAgent(ctx context.Context, _ *AgentState) (context.Context, error) { return ctx, nil }
-func (BaseMiddleware) AfterAgent(_ context.Context, _ *AgentState, _ *schema.Message) error { return nil }
-func (BaseMiddleware) BeforeModel(ctx context.Context, _ *AgentState) (context.Context, error) { return ctx, nil }
-func (BaseMiddleware) AfterModel(_ context.Context, _ *AgentState, _ *schema.Message) error { return nil }
+func (BaseMiddleware) BeforeAgent(ctx context.Context, _ *AgentState) (context.Context, error) {
+	return ctx, nil
+}
+func (BaseMiddleware) AfterAgent(_ context.Context, _ *AgentState, _ *schema.Message) error {
+	return nil
+}
+func (BaseMiddleware) BeforeModel(ctx context.Context, _ *AgentState) (context.Context, error) {
+	return ctx, nil
+}
+func (BaseMiddleware) AfterModel(_ context.Context, _ *AgentState, _ *schema.Message) error {
+	return nil
+}
 
 // BudgetMiddleware 已被 BudgetModel 装饰器取代，当前未接入 Graph。
 // 装饰器在每次模型调用处统一处理预算检查 / 超时 / 重试 / 用量记录 / 无进展，

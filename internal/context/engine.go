@@ -48,11 +48,6 @@ const (
 	// 就至少存在可摘要的中间段。取 0.25 是留出余量：默认 CompressThreshold=0.8 时，
 	// 中间段至少能占到消息总量的约 3/4。
 	maxTailRatio = 0.25
-
-	// multimodalTokensPerPart 是单个非文本消息分片（图片/音频/视频/文件）的预留 token 数。
-	// 这类分片的实际开销由 provider 侧按分辨率等计算，框架层用固定预留量兜底，
-	// 避免含图消息被估成 0 token 而绕过压缩阈值。
-	multimodalTokensPerPart = 1024
 )
 
 // Engine 负责上下文装配与压缩
@@ -72,6 +67,20 @@ type Engine struct {
 	IsNonIdempotent func(toolName string) bool
 
 	summaryModel model.BaseChatModel // 用于结构化摘要，可为 nil（降级为规则摘要）
+
+	// OnCompacted 是可选的压缩观测钩子：每次压缩事件结束后同步调用一次。
+	//
+	// 为什么必须有它：压缩是「收益容易测、代价难测」的典型——省下的 token 看得见，
+	// 丢信息导致的失败率上升、摘要 LLM 自身的开销、缓存前缀被作废的次数，全都发生在
+	// 这一瞬间。没有观测点，任何调参都是盲调，也无法区分「提升来自算法」与「提升来自
+	// 多花了算力」。
+	//
+	// 钩子给出压缩前后的 token、采样与淘汰条数、摘要开销、不可恢复丢失条数与前缀
+	// watermark。外层据此桥接为 projection.ContextCompacted 信号或指标系统。
+	// context 包不反向依赖 projection，避免装配层与观测层形成环。
+	//
+	// 钩子必须非阻塞、不得长期持有 stats 之外的资源；落地为信号或指标由外层负责。
+	OnCompacted func(stats CompressStats)
 
 	// mu 保护 overhead：装配期写入、循环内读取，避免数据竞争。
 	mu       sync.RWMutex
@@ -125,7 +134,7 @@ func (e *Engine) SetSpillStore(s SpillStore) {
 // 只看 estimateTokens(messages) 会漏掉工具 schema 等不在消息列表里的真实输入，
 // 导致阈值失真、压缩触发过晚。
 func (e *Engine) effectiveTokens(messages []*schema.Message) int {
-	return estimateTokens(messages) + e.Overhead().Total()
+	return EstimateMessagesTokens(messages) + e.Overhead().Total()
 }
 
 // softLimit 返回触发压缩的 token 线。
@@ -195,20 +204,69 @@ func (e *Engine) tailBudget() int {
 //
 // 一旦触发，就一次清理到 lowWater 以下（clear_at_least），而不是清一条查一条：
 // 一次性付费、随后多轮命中缓存。
+//
+// 未越 softLimit 时直接返回原序列且不发观测事件：这类轮次占绝大多数，
+// 每次模型调用都发一条「未压缩」信号会淹掉真正需要看的事件。
+// 反之，越过阈值却没改写序列（Triggered=false）会被如实上报——那正是
+// §1「middle 恒空」和 §3「keepRecent 免死金牌」两类静默失效的特征。
 func (e *Engine) CompressInPlace(ctx context.Context, messages []*schema.Message) []*schema.Message {
-	if e.effectiveTokens(messages) <= e.softLimit() {
-		return messages
+	out, _ := e.CompressInPlaceWithStats(ctx, messages)
+	return out
+}
+
+// CompressInPlaceWithStats 是 CompressInPlace 的统计版本，额外返回本次压缩的账本。
+//
+// 之所以要「返回值」而不只依赖 OnCompacted 钩子：Engine 是跨 Turn 共享的单例，
+// 钩子只能指向一个目标；而 Budget 是按 Turn 创建的。若靠钩子把账本塞进 Budget，
+// 并发 Turn 之间会串号。返回值让调用方自己决定记到哪个 Budget 上，天然无竞态。
+//
+// 未越过 softLimit 时返回原序列且 stats.Triggered=false——这类轮次占绝大多数，
+// 调用方据此可选择不记账，避免 CompressEvents 退化成「模型调用次数」。
+func (e *Engine) CompressInPlaceWithStats(
+	ctx context.Context,
+	messages []*schema.Message,
+) (out []*schema.Message, stats CompressStats) {
+
+	before := e.effectiveTokens(messages)
+	if before <= e.softLimit() {
+		return messages, CompressStats{Path: "inplace", TokensBefore: before, TokensAfter: before}
 	}
+
+	stats = CompressStats{Path: "inplace", TokensBefore: before}
+	defer func() {
+		stats.TokensAfter = e.effectiveTokens(out)
+		stats.Triggered = stats.Sampled > 0 || stats.Evicted > 0 || stats.Placeholders > 0
+		e.notifyCompacted(stats)
+	}()
+
 	// 先采样再淘汰：采样不受 keepRecent 豁免，专治「一两条巨型结果撑爆窗口」——
 	// 这正是 evictToolResults 因总数不足而直接放弃的那类场景。
-	sampled := e.sampleOversizedResults(ctx, messages)
+	sampled, nSampled, nSampledOffloaded := e.sampleOversizedResultsCounted(ctx, messages)
+	stats.Sampled = nSampled
+	stats.Offloaded += nSampledOffloaded
+
 	// 采样已把体量压到低水位以下时，不再淘汰任何整条结果：
 	// 每淘汰一条就改写一段历史、作废一次缓存前缀，能不付就不付。
 	if e.effectiveTokens(sampled) <= e.lowWater() {
-		return fixToolCallPairs(sampled)
+		res, ph := e.fixToolCallPairsCounted(ctx, sampled)
+		stats.Placeholders = ph
+		stats.UnrecoverableLost = (stats.Sampled - nSampledOffloaded) + ph
+		stats.StablePrefixTokens = stablePrefixTokens(messages, res)
+		return res, stats
 	}
-	evicted := e.evictToolResults(ctx, sampled, trimKeepRecentTools, e.lowWater())
-	return fixToolCallPairs(evicted)
+
+	evicted, nEvicted, nEvictedOffloaded := e.evictToolResultsCounted(ctx, sampled, trimKeepRecentTools, e.lowWater())
+	stats.Evicted = nEvicted
+	stats.Offloaded += nEvictedOffloaded
+
+	res, ph := e.fixToolCallPairsCounted(ctx, evicted)
+	stats.Placeholders = ph
+	// 不可恢复丢失 = 采样/淘汰中未成功 offload 的部分 + 配对补洞。
+	// 这些内容既没有回读路径、也不体现在任何 token 节省里，是代价侧唯一
+	// 无法用 token 衡量的量，直接对应下游任务失败与幻觉风险。
+	stats.UnrecoverableLost = (stats.Sampled - nSampledOffloaded) + (stats.Evicted - nEvictedOffloaded) + ph
+	stats.StablePrefixTokens = stablePrefixTokens(messages, res)
+	return res, stats
 }
 
 // Assemble 装配模型可见上下文，必要时触发压缩
@@ -219,20 +277,43 @@ func (e *Engine) Assemble(
 	history []*schema.Message,
 	userInput string,
 ) ([]*schema.Message, error) {
+	out, _, err := e.AssembleWithStats(ctx, systemPrompt, state, history, userInput)
+	return out, err
+}
+
+// AssembleWithStats 是 Assemble 的统计版本，额外返回本次装配的压缩账本。
+//
+// 未触发压缩时返回的账本 Triggered=false。与 CompressInPlaceWithStats 同理，
+// 用返回值而非钩子传递账本，是因为 Engine 跨 Turn 共享、Budget 按 Turn 创建，
+// 靠钩子转发会在并发 Turn 间串号。
+func (e *Engine) AssembleWithStats(
+	ctx context.Context,
+	systemPrompt string,
+	state *session.State,
+	history []*schema.Message,
+	userInput string,
+) (out []*schema.Message, stats CompressStats, err error) {
 
 	messages := make([]*schema.Message, 0, len(history)+3)
 	messages = append(messages, schema.SystemMessage(systemPrompt))
-	if state != nil && state.MemorySummary != "" {
-		messages = append(messages, schema.SystemMessage(state.MemorySummary))
+	if state != nil && state.Memory.Summary != "" {
+		messages = append(messages, schema.SystemMessage(state.Memory.Summary))
 	}
 	messages = append(messages, history...)
 	messages = append(messages, schema.UserMessage(userInput))
 
+	before := e.effectiveTokens(messages)
 	if !e.shouldCompress(messages) {
-		return messages, nil
+		return messages, CompressStats{
+			Path: "assemble", TokensBefore: before, TokensAfter: before,
+		}, nil
 	}
 
-	return e.compress(ctx, messages, state)
+	out, stats, err = e.compress(ctx, messages, state)
+	if err != nil {
+		return nil, stats, err
+	}
+	return out, stats, nil
 }
 
 // ----------------------------------------------------------------------------
@@ -247,32 +328,59 @@ func (e *Engine) compress(
 	ctx context.Context,
 	messages []*schema.Message,
 	state *session.State,
-) ([]*schema.Message, error) {
+) (out []*schema.Message, stats CompressStats, err error) {
+
+	before := e.effectiveTokens(messages)
+	stats = CompressStats{Path: "assemble", TokensBefore: before}
+	defer func() {
+		if err != nil {
+			return // 摘要失败时未产出任何压缩结果，不记账，避免污染统计
+		}
+		stats.TokensAfter = e.effectiveTokens(out)
+		stats.Triggered = stats.Sampled > 0 || stats.Evicted > 0 ||
+			stats.Placeholders > 0 || stats.SummaryTokens > 0
+		stats.StablePrefixTokens = stablePrefixTokens(messages, out)
+		e.notifyCompacted(stats)
+	}()
 
 	// 阶段①：工具结果减负（规则，不调 LLM，可 offload 回读）
 	// 先采样巨型单条结果（不受 keepRecent 豁免），再按 oldest-first 淘汰整条。
-	sampled := e.sampleOversizedResults(ctx, messages)
-	trimmed := e.evictToolResults(ctx, sampled, trimKeepRecentTools, e.lowWater())
+	sampled, nSampled, nSampledOffloaded := e.sampleOversizedResultsCounted(ctx, messages)
+	trimmed, nEvicted, nEvictedOffloaded := e.evictToolResultsCounted(ctx, sampled, trimKeepRecentTools, e.lowWater())
+	stats.Sampled = nSampled
+	stats.Evicted = nEvicted
+	stats.Offloaded = nSampledOffloaded + nEvictedOffloaded
 
 	// 阶段②：边界确定，保护头尾
 	head, middle, tail := splitByBoundary(trimmed, e.tailBudget())
 	if len(middle) == 0 {
-		return fixToolCallPairs(trimmed), nil
+		// middle 为空 = 结构化摘要阶段无事可做。这正是 §1「尾部保护区吞空 middle」
+		// 的失效特征：SummaryTokens 为 0 会被如实上报，据此可发现阈值配错。
+		fixed, ph := e.fixToolCallPairsCounted(ctx, trimmed)
+		stats.Placeholders = ph
+		stats.UnrecoverableLost = (nSampled - nSampledOffloaded) + (nEvicted - nEvictedOffloaded) + ph
+		return fixed, stats, nil
 	}
 
 	// 阶段③：结构化摘要（仅调用一次 LLM，增量更新）
 	var prevSummary string
 	if state != nil {
-		prevSummary = state.MemorySummary
+		prevSummary = state.Memory.Summary
 	}
-	summary, err := e.summarize(ctx, middle, prevSummary)
-	if err != nil {
-		return nil, err
+	summary, modelTokens, viaLLM, sumErr := e.summarize(ctx, middle, prevSummary)
+	if sumErr != nil {
+		return nil, stats, sumErr
 	}
 	summary = e.truncateSummary(summary, middle)
 
+	stats.SummaryTokens = EstimateTextTokens(summary)
+	// 摘要 LLM 调用自身的开销记入账本。它是压缩的成本而非收益：
+	// NetTokensSaved 会把它从毛节省里扣掉，否则净收益被系统性高估。
+	stats.SummaryModelTokens = modelTokens
+	stats.SummaryViaLLM = viaLLM
+
 	if state != nil {
-		state.MemorySummary = summary
+		state.Memory.Summary = summary
 	}
 
 	// 阶段④：工具调用对修复
@@ -281,7 +389,11 @@ func (e *Engine) compress(
 	merged = append(merged, schema.SystemMessage(summary))
 	merged = append(merged, tail...)
 
-	return fixToolCallPairs(merged), nil
+	fixed, ph := e.fixToolCallPairsCounted(ctx, merged)
+	stats.Placeholders = ph
+	stats.UnrecoverableLost = (nSampled - nSampledOffloaded) + (nEvicted - nEvictedOffloaded) + ph
+
+	return fixed, stats, nil
 }
 
 // ----------------------------------------------------------------------------
@@ -316,6 +428,21 @@ func (e *Engine) evictToolResults(
 	keepRecent int,
 	lowWater int,
 ) []*schema.Message {
+	out, _, _ := e.evictToolResultsCounted(ctx, messages, keepRecent, lowWater)
+	return out
+}
+
+// evictToolResultsCounted 是 evictToolResults 的计数版本，额外返回
+// 「被替换为 stub 的条数」与「其中原文成功 offload、因而可回读的条数」。
+//
+// 两者之差就是不可恢复丢失：未配置 SpillStore，或 buildStub 内 offload 写入失败。
+// 保留原签名的 evictToolResults 作委托，是为了不牵动既有调用点与测试。
+func (e *Engine) evictToolResultsCounted(
+	ctx context.Context,
+	messages []*schema.Message,
+	keepRecent int,
+	lowWater int,
+) (out []*schema.Message, evicted, offloaded int) {
 
 	toolIdxs := make([]int, 0)
 	for i, m := range messages {
@@ -324,12 +451,12 @@ func (e *Engine) evictToolResults(
 		}
 	}
 	if len(toolIdxs) <= keepRecent {
-		return messages
+		return messages, 0, 0
 	}
 
 	spill := e.spillStore()
 
-	out := make([]*schema.Message, len(messages))
+	out = make([]*schema.Message, len(messages))
 	copy(out, messages)
 
 	// oldest-first：候选区间是除最近 keepRecent 条之外的全部工具结果
@@ -347,16 +474,23 @@ func (e *Engine) evictToolResults(
 
 		stub := e.buildStub(ctx, orig, spill)
 		if stub == nil {
+			// offload 写入失败：宁可保留原文也不丢数据，故不计入任何淘汰数
 			continue
 		}
 		out[idx] = stub
+		evicted++
+		// 只有原文确实落盘且有 tool_call_id 可寻址时，这条淘汰才是可恢复的。
+		// 与 buildStub 内选择「恢复方式 / 不可回读」文案的条件严格一致。
+		if spill != nil && orig.ToolCallID != "" {
+			offloaded++
+		}
 
 		// clear_at_least：达到低水位就停，不追求清得更多
 		if e.effectiveTokens(out) <= lowWater {
 			break
 		}
 	}
-	return out
+	return out, evicted, offloaded
 }
 
 // buildStub 构造可操作的占位符。offload 成功时附带回读路径，失败/未配置时降级。
@@ -429,9 +563,20 @@ func isStub(m *schema.Message) bool {
 // 未配置时只对可重放（幂等）工具采样——因为采样会永久丢弃中段，而幂等工具
 // 的结果模型可重新调用取回，非幂等工具则宁可保留原文也不冒险。
 func (e *Engine) sampleOversizedResults(ctx context.Context, messages []*schema.Message) []*schema.Message {
+	out, _, _ := e.sampleOversizedResultsCounted(ctx, messages)
+	return out
+}
+
+// sampleOversizedResultsCounted 是 sampleOversizedResults 的计数版本，
+// 额外返回「被采样的条数」与「其中原文成功 offload、因而可回读的条数」。
+func (e *Engine) sampleOversizedResultsCounted(
+	ctx context.Context,
+	messages []*schema.Message,
+) (out []*schema.Message, sampled, offloaded int) {
+
 	threshold := int(float64(e.softLimit()) * oversizedResultRatio)
 	if threshold <= 0 {
-		return messages
+		return messages, 0, 0
 	}
 	spill := e.spillStore()
 
@@ -439,12 +584,10 @@ func (e *Engine) sampleOversizedResults(ctx context.Context, messages []*schema.
 	// 各自不超过 sampleHeadChars / sampleTailChars 的绝对上限。
 	//
 	// 为什么必须自适应而不是固定头尾长度：固定 1024+512 字符在大窗口下很合适，
-	// 但换算成 token 约 768，会高于小窗口场景的阈值本身——采样完仍超阈，等于白做。
-	// 按阈值比例缩放后，采样结果必定落在阈值以下，两种窗口尺寸都成立。
-	headChars, tailChars := sampleWindow(threshold)
-	minOriginal := headChars + tailChars + sampleMetaSlack
-
-	out := make([]*schema.Message, len(messages))
+	// 但小窗口场景下会高于阈值本身——采样完仍超阈，等于白做。
+	// 换算字符数时按每条内容的实测密度进行，而不是假定某一种语言：
+	// JSON / 代码类结果能保留约 3.6 倍于中文的字符量，两者都不会超预算。
+	out = make([]*schema.Message, len(messages))
 	copy(out, messages)
 
 	changed := false
@@ -456,12 +599,12 @@ func (e *Engine) sampleOversizedResults(ctx context.Context, messages []*schema.
 		if isStub(m) {
 			continue
 		}
-		if estimateMessageTokens(m) <= threshold {
+		if EstimateMessageTokens(m) <= threshold {
 			continue
 		}
-		runes := []rune(m.Content)
+		headChars, tailChars := sampleWindow(threshold, TextDensity(m.Content))
 		// 原文尚未超过「头+尾+metadata」的体积时，采样没有意义（可能反而更大），跳过
-		if len(runes) <= minOriginal {
+		if len([]rune(m.Content)) <= headChars+tailChars+sampleMetaSlack {
 			continue
 		}
 		// 未配置 spill 时，采样会永久丢失中段：非幂等工具结果不可重放，跳过不采
@@ -469,27 +612,44 @@ func (e *Engine) sampleOversizedResults(ctx context.Context, messages []*schema.
 			continue
 		}
 
-		sampled := e.buildSampled(ctx, m, spill, headChars, tailChars)
-		if sampled == nil {
+		res := e.buildSampled(ctx, m, spill, headChars, tailChars)
+		if res == nil {
+			// offload 写入失败：保留原文，不计入任何采样数
 			continue
 		}
-		out[i] = sampled
+		out[i] = res
+		sampled++
+		// 与 buildSampled 内选择「回读 / 不可回读」文案的条件严格一致
+		if spill != nil && m.ToolCallID != "" {
+			offloaded++
+		}
 		changed = true
 	}
 	if !changed {
-		return messages
+		return messages, 0, 0
 	}
-	return out
+	return out, sampled, offloaded
 }
 
-// sampleWindow 按超尺寸阈值换算头尾各自的保留字符数。
-// 估算口径与 estimateTextTokens 一致（约 2 字符 = 1 token）。
-func sampleWindow(thresholdTokens int) (headChars, tailChars int) {
-	headChars = thresholdTokens // 阈值一半的 token ≈ 阈值大小的字符数
+// sampleWindow 按超尺寸阈值与内容密度换算头尾各自的保留字符数。
+//
+// density 是该内容「每字符的 token 数」（见 TextDensity），用来把 token 预算反推为
+// 字符预算。此前实现假定固定「2 字符 = 1 token」，对两类主流内容都会失真：
+// 中文（密度约 0.7）会被砍得过多、丢掉有效信息，而 JSON / 代码（密度约 0.28）
+// 会保留远超必要的字符、采样完仍超阈。按实测密度换算后两者都恰好落在预算内。
+//
+// 预算分配：头占阈值的一半 token、尾占四分之一 token，各自不超过
+// sampleHeadChars / sampleTailChars 的绝对上限。density 非法时回落到最保守值，
+// 宁可少留也不冒超阈的风险。
+func sampleWindow(thresholdTokens int, density float64) (headChars, tailChars int) {
+	if density <= 0 || density > 1 {
+		density = tokensPerCJKChar
+	}
+	headChars = int(float64(thresholdTokens) / 2 / density)
 	if headChars > sampleHeadChars {
 		headChars = sampleHeadChars
 	}
-	tailChars = thresholdTokens / 2 // 阈值四分之一的 token
+	tailChars = int(float64(thresholdTokens) / 4 / density)
 	if tailChars > sampleTailChars {
 		tailChars = sampleTailChars
 	}
@@ -613,14 +773,14 @@ func splitByBoundary(
 	// 第二道收敛：按消息实际总量限制尾部占比，确保中间段非空。
 	// 只在 rest 有 2 条以上时收——只有 1 条时无论怎么分都没有中间段可言。
 	if len(rest) > 1 {
-		if shareCap := int(float64(estimateTokens(rest)) * maxTailShareOfMessages); shareCap > 0 && shareCap < tailBudget {
+		if shareCap := int(float64(EstimateMessagesTokens(rest)) * maxTailShareOfMessages); shareCap > 0 && shareCap < tailBudget {
 			tailBudget = shareCap
 		}
 	}
 	tailStart := len(rest)
 	used := 0
 	for i := len(rest) - 1; i >= 0; i-- {
-		t := estimateMessageTokens(rest[i])
+		t := EstimateMessageTokens(rest[i])
 		if used+t > tailBudget && tailStart < len(rest) {
 			break
 		}
@@ -650,14 +810,24 @@ const summarySchemaPrompt = `你是对话上下文压缩器。请把给定的历
 
 // summarize 对中间段做结构化摘要。
 // 第二次及以后在前一次摘要基础上增量更新，避免语义漂移。
+//
+// 除摘要文本外还返回两项观测信息：
+//   - modelTokens：摘要 LLM 这次调用自身烧掉的 token。它是压缩的成本而非收益，
+//     NetTokensSaved 会把它从毛节省里扣掉。不记这一项，压缩效果会被系统性高估，
+//     且「摘要越做越贵」这种退化完全不可见。
+//   - viaLLM：是否真的走了 LLM 结构化摘要路径。为 false 表示降级成了规则摘要
+//     （只有「已省略 N 条消息」一句，跨轮记忆实际上是空的）——这是 §1 那类
+//     静默失效的直接特征，必须能从数据里看出来。
+//
+// provider 未返回用量时按估算兜底，避免成本项恒为 0 而虚增净收益。
 func (e *Engine) summarize(
 	ctx context.Context,
 	middle []*schema.Message,
 	prevSummary string,
-) (string, error) {
+) (summary string, modelTokens int, viaLLM bool, err error) {
 
 	if len(middle) == 0 {
-		return prevSummary, nil
+		return prevSummary, 0, false, nil
 	}
 
 	// 无摘要模型时降级为规则摘要，保证链路可用
@@ -665,7 +835,7 @@ func (e *Engine) summarize(
 		return fmt.Sprintf(
 			"[历史压缩] 已省略 %d 条较早消息，最早一条为 %s 角色。",
 			len(middle), middle[0].Role,
-		), nil
+		), 0, false, nil
 	}
 
 	var sb strings.Builder
@@ -694,18 +864,38 @@ func (e *Engine) summarize(
 		schema.UserMessage(sb.String()),
 	}
 
-	out, err := e.summaryModel.Generate(ctx, req)
-	if err != nil {
-		return "", fmt.Errorf("summarize: %w", err)
+	out, genErr := e.summaryModel.Generate(ctx, req)
+	if genErr != nil {
+		return "", 0, false, fmt.Errorf("summarize: %w", genErr)
 	}
 	if out == nil {
-		return prevSummary, nil
+		return prevSummary, 0, true, nil
 	}
-	return out.Content, nil
+
+	// 摘要成本 = 这次调用的 prompt + completion。provider 给了用量就用真实值，
+	// 否则按本地估算兜底——宁可略微不准，也不能让成本项静默为 0。
+	if out.ResponseMeta != nil && out.ResponseMeta.Usage != nil && out.ResponseMeta.Usage.TotalTokens > 0 {
+		modelTokens = out.ResponseMeta.Usage.TotalTokens
+	} else {
+		modelTokens = EstimateMessagesTokens(req) + EstimateTextTokens(out.Content)
+	}
+
+	return out.Content, modelTokens, true, nil
 }
 
 // truncateSummary 执行摘要预算：
 // 摘要长度 ≤ 被压缩内容的 MaxSummaryRatio，且 ≤ MaxSummaryTokens，取最严约束。
+//
+// 超预算时按「整行字段」截断，而不是按 rune 硬切。原因有两层：
+//
+//  1. 七字段摘要是按行输出的，硬切会把某个字段砍成半句（如「下一步: 应当先修」），
+//     模型读到的是残缺指令；
+//  2. 更要命的是增量更新——本次摘要会被写回 state.Memory.Summary，作为下一轮的
+//     prevSummary 喂给摘要模型。残片进入下一轮，模型会在残句基础上继续改写，
+//     错误逐轮累积，最终摘要可能完全偏离原始任务。
+//
+// 因此宁可整字段丢弃、并在末尾留一行显式标记，也不留半句。标记同时给出恢复路径，
+// 让模型知道信息是被裁剪而非不存在。
 func (e *Engine) truncateSummary(summary string, source []*schema.Message) string {
 	if summary == "" {
 		return summary
@@ -716,24 +906,85 @@ func (e *Engine) truncateSummary(summary string, source []*schema.Message) strin
 		budget = defaultMaxSummaryToken
 	}
 	if e.MaxSummaryRatio > 0 {
-		srcTokens := estimateTokens(source)
+		srcTokens := EstimateMessagesTokens(source)
 		ratioBudget := int(float64(srcTokens) * e.MaxSummaryRatio)
 		if ratioBudget > 0 && ratioBudget < budget {
 			budget = ratioBudget
 		}
 	}
 
-	if estimateTextTokens(summary) <= budget {
+	if EstimateTextTokens(summary) <= budget {
 		return summary
 	}
 
-	// 按 rune 保守截断（粗略按 1 token ≈ 2 字符）
-	maxChars := budget * 2
-	runes := []rune(summary)
-	if len(runes) > maxChars {
-		runes = runes[:maxChars]
+	return truncateSummaryByField(summary, budget)
+}
+
+// summaryTruncatedNote 是摘要被裁剪时追加的标记行。
+const summaryTruncatedNote = "[摘要超预算，已按字段截断；更早细节可凭 tool_call_id 调 read_result 回读]"
+
+// truncateSummaryByField 按行（字段）边界把摘要裁剪到预算内。
+//
+// 从前往后保留完整的行，直到再加一行就会超预算；随后追加截断标记行，标记本身也计入预算。
+// 单行就超预算时（极端情况），退化为按 rune 截断该行——此时已无字段结构可言，
+// 保证不超预算优先。
+func truncateSummaryByField(summary string, budget int) string {
+	noteTokens := EstimateTextTokens(summaryTruncatedNote)
+
+	var sb strings.Builder
+	used := 0
+	// 给标记行预留空间；预算过小连标记都放不下时，退化为纯截断
+	limit := budget - noteTokens
+	if limit <= 0 {
+		limit = budget
+		noteTokens = 0
 	}
-	return string(runes)
+
+	lines := strings.Split(summary, "\n")
+	kept := 0
+	for _, line := range lines {
+		lt := EstimateTextTokens(line)
+		if used+lt > limit {
+			// 一行都放不下时按 rune 截断该行，避免整体丢失
+			if kept == 0 {
+				sb.WriteString(truncateToTokens(line, limit))
+				kept = 1
+			}
+			break
+		}
+		if kept > 0 {
+			sb.WriteString("\n")
+		}
+		sb.WriteString(line)
+		used += lt
+		kept++
+	}
+
+	if noteTokens > 0 && kept > 0 {
+		if kept < len(lines) {
+			sb.WriteString("\n")
+			sb.WriteString(summaryTruncatedNote)
+		}
+	}
+	return sb.String()
+}
+
+// truncateToTokens 把单行文本按 rune 截到不超过 budgetTokens。
+// 使用内容自身的实测密度换算字符数，而不是假定固定的字符/token 比。
+func truncateToTokens(s string, budgetTokens int) string {
+	if budgetTokens <= 0 {
+		return ""
+	}
+	density := TextDensity(s)
+	if density <= 0 {
+		return ""
+	}
+	maxChars := int(float64(budgetTokens) / density)
+	runes := []rune(s)
+	if len(runes) <= maxChars {
+		return s
+	}
+	return string(runes[:maxChars])
 }
 
 // ----------------------------------------------------------------------------
@@ -742,7 +993,33 @@ func (e *Engine) truncateSummary(summary string, source []*schema.Message) strin
 
 // fixToolCallPairs 修复被压缩切断的 tool_call / tool_result 配对。
 // 保证压缩后的消息序列在协议层自洽，否则下次模型调用会直接报错。
+//
+// 这是不感知 SpillStore 的版本（包级函数，无引擎状态）。需要占位符带回读路径、
+// 或需要统计补洞条数时，用 fixToolCallPairsCounted。
 func fixToolCallPairs(messages []*schema.Message) []*schema.Message {
+	out, _ := (&Engine{}).fixToolCallPairsCounted(nil, messages)
+	return out
+}
+
+// fixToolCallPairsCounted 是 fixToolCallPairs 的引擎感知版本，额外返回补入的占位符条数。
+//
+// 与包级版本的两点差异，都是为了让「被动补洞」不再静默丢信息：
+//
+//  1. 占位符带回读路径。此前占位符内容是固定的一句「[该工具结果已被上下文压缩省略]」，
+//     而 buildStub 产出的 stub 是带 tool_call_id 与 read_result 恢复方式的——同一个
+//     「结果不在上下文里」的处境，两条路径给模型的能力不一致。凡是原文确实已 offload
+//     到 SpillStore 的，这里补上同样的回读指引；没有的则明确告知不可回读、需重新调用工具。
+//     没有这层区分，模型会对着一句「已省略」凭空编造结果——这是压缩引发幻觉的主要来源。
+//
+//  2. 统计补洞条数并计入不可恢复丢失。这类占位符不参与任何 token 节省的核算，
+//     却代表模型确实少看到了一次工具结果，必须单独计数才能和任务失败率对上。
+//
+// 传入 nil ctx 时跳过 spill 查询（等价于未配置 spill 的行为）。
+func (e *Engine) fixToolCallPairsCounted(
+	ctx context.Context,
+	messages []*schema.Message,
+) (out []*schema.Message, placeholders int) {
+
 	declared := make(map[string]struct{})
 	for _, m := range messages {
 		if m == nil || m.Role != schema.Assistant {
@@ -763,7 +1040,7 @@ func fixToolCallPairs(messages []*schema.Message) []*schema.Message {
 		answered[m.ToolCallID] = struct{}{}
 	}
 
-	out := make([]*schema.Message, 0, len(messages))
+	out = make([]*schema.Message, 0, len(messages))
 	for _, m := range messages {
 		if m == nil {
 			continue
@@ -793,68 +1070,60 @@ func fixToolCallPairs(messages []*schema.Message) []*schema.Message {
 					Role:       schema.Tool,
 					ToolCallID: tc.ID,
 					ToolName:   tc.Function.Name,
-					Content:    "[该工具结果已被上下文压缩省略]",
+					Content:    e.placeholderContent(ctx, tc.ID, tc.Function.Name),
+					// 标记为已处理，使后续压缩轮次跳过它、不反复改写
+					Extra: map[string]any{extraKeyStub: true},
 				})
 				answered[tc.ID] = struct{}{}
+				placeholders++
 			}
 		}
 	}
-	return out
+	return out, placeholders
 }
 
-// ----------------------------------------------------------------------------
-// Token 估算（粗略，生产环境建议替换为 tiktoken）
-// ----------------------------------------------------------------------------
-
-func estimateTokens(messages []*schema.Message) int {
-	total := 0
-	for _, m := range messages {
-		total += estimateMessageTokens(m)
+// placeholderContent 生成配对修复时补入的占位符文案。
+//
+// 分三种情况，核心是不给模型留「凭空编造」的空间：
+//
+//  1. 原文已 offload 到 SpillStore → 给出 read_result 回读路径，与 buildStub 的
+//     stub 能力对齐。此前占位符只有一句「已被省略」，而 stub 却带回读方式，
+//     同样「结果不在上下文」的处境给模型的能力不一致，模型对着占位符只能幻觉。
+//  2. 未配置 SpillStore / 原文不在其中 → 明确告知不可回读、需要时重新调用工具。
+//     「不可回读」这四个字必须写出来，否则模型无法区分「信息被裁剪」与「信息不存在」。
+//  3. 无 tool_call_id → 无从寻址，只能降级为最简文案。
+//
+// 探测存在性用 Read 而非新增接口方法：SpillStore 只有 Spill/Read 两个方法，
+// 为一次探测扩接口会让所有外部实现者被迫改动；这里读出即弃，代价是一次内存查询。
+func (e *Engine) placeholderContent(ctx context.Context, toolCallID, toolName string) string {
+	name := toolName
+	if name == "" {
+		name = "未知工具"
 	}
-	return total
-}
 
-func estimateMessageTokens(m *schema.Message) int {
-	if m == nil {
-		return 0
-	}
-	n := estimateTextTokens(m.Content)
-	n += estimateTextTokens(m.ReasoningContent)
-	for _, tc := range m.ToolCalls {
-		n += estimateTextTokens(tc.Function.Name)
-		n += estimateTextTokens(tc.Function.Arguments)
-	}
-	n += estimateMultiContentTokens(m)
-	return n + 4 // 消息结构固定开销
-}
-
-// estimateMultiContentTokens 估算多模态分片的开销。
-// 非文本分片（图片/音频/视频/文件）按固定预留量计，文本分片按字符估算。
-// 漏算会让含图消息被估成近乎 0 token，从而永远不触发压缩。
-func estimateMultiContentTokens(m *schema.Message) int {
-	n := 0
-	// MultiContent 已废弃但仍被部分 provider 使用，一并计入
-	for _, part := range m.MultiContent {
-		if part.Type == schema.ChatMessagePartTypeText {
-			n += estimateTextTokens(part.Text)
-			continue
+	if toolCallID != "" && e != nil {
+		if spill := e.spillStore(); spill != nil {
+			if ctx == nil {
+				ctx = context.Background()
+			}
+			// 读出即弃：只用错误与否判断原文是否可寻址，内容本身不需要
+			if _, err := spill.Read(ctx, SpillRef(toolCallID)); err == nil {
+				return fmt.Sprintf(
+					"[工具 %s 的结果已移出上下文]\n调用: %s\n恢复方式: 调用 read_result 工具（传 tool_call_id=%s）回读完整结果",
+					name, toolCallID, toolCallID,
+				)
+			}
 		}
-		n += multimodalTokensPerPart
 	}
-	for _, part := range m.UserInputMultiContent {
-		if part.Type == schema.ChatMessagePartTypeText {
-			n += estimateTextTokens(part.Text)
-			continue
-		}
-		n += multimodalTokensPerPart
-	}
-	return n
-}
 
-// estimateTextTokens 中英混排的粗略估算：约 2 字符 = 1 token
-func estimateTextTokens(s string) int {
-	if s == "" {
-		return 0
+	if toolCallID != "" {
+		return fmt.Sprintf(
+			"[工具 %s 的结果已被上下文压缩省略，且原文不可回读]\n调用: %s\n注意: 如需该数据请重新调用工具，不要基于本占位符推断结果",
+			name, toolCallID,
+		)
 	}
-	return len([]rune(s))/2 + 1
+	return fmt.Sprintf(
+		"[工具 %s 的结果已被上下文压缩省略，且原文不可回读]\n注意: 如需该数据请重新调用工具，不要基于本占位符推断结果",
+		name,
+	)
 }

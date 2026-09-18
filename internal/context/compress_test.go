@@ -49,12 +49,12 @@ func TestCompressInPlaceSkipsWhenUnderSoftLimit(t *testing.T) {
 	e.SetSpillStore(NewMemorySpillStore())
 
 	msgs := buildToolHistory(10, 200)
-	before := estimateTokens(msgs)
+	before := EstimateMessagesTokens(msgs)
 
 	out := e.CompressInPlace(context.Background(), msgs)
 
-	if estimateTokens(out) != before {
-		t.Errorf("未超阈值却改动了消息：token %d → %d", before, estimateTokens(out))
+	if EstimateMessagesTokens(out) != before {
+		t.Errorf("未超阈值却改动了消息：token %d → %d", before, EstimateMessagesTokens(out))
 	}
 	// 指针级校验：应当原样返回，没有任何替换
 	for i := range out {
@@ -75,8 +75,10 @@ func TestCompressInPlaceEvictsToLowWater(t *testing.T) {
 	spill := NewMemorySpillStore()
 	e.SetSpillStore(spill)
 
-	// 20 条 × 800 字符 ≈ 8100 token，刚好越过 softLimit
-	msgs := buildToolHistory(20, 800)
+	// 20 条 × 1600 字符（ASCII）≈ 20 × 452 token ≈ 9000，越过 softLimit=8000。
+	// 字符规模按 EstimateTextTokens 的 ASCII 密度 0.28 换算，不是旧的 0.5——
+	// 旧估算把这类内容高估近 1.8 倍，所以此前 800 字符就够触发，现在需要约两倍。
+	msgs := buildToolHistory(20, 1600)
 	if e.effectiveTokens(msgs) <= e.softLimit() {
 		t.Fatalf("测试前提不成立：初始 token %d 未越 softLimit %d",
 			e.effectiveTokens(msgs), e.softLimit())
@@ -278,7 +280,7 @@ func TestEffectiveTokensCountsOverhead(t *testing.T) {
 
 	// 消息本体很小，远不到 softLimit
 	msgs := buildToolHistory(10, 200)
-	if msgTokens := estimateTokens(msgs); msgTokens >= e.softLimit() {
+	if msgTokens := EstimateMessagesTokens(msgs); msgTokens >= e.softLimit() {
 		t.Fatalf("测试前提不成立：消息本体 %d token 已达 softLimit", msgTokens)
 	}
 	if e.shouldCompress(msgs) {
@@ -288,8 +290,8 @@ func TestEffectiveTokensCountsOverhead(t *testing.T) {
 	// 注入大额 overhead（模拟庞大的系统提示 + 技能索引 + 工具 schema）
 	e.SetOverhead(PromptOverheadSnapshot{SystemTokens: 5000, ToolsTokens: 4000})
 
-	if got := e.effectiveTokens(msgs); got != estimateTokens(msgs)+9000 {
-		t.Errorf("effectiveTokens 未计入 overhead：期望 %d，实际 %d", estimateTokens(msgs)+9000, got)
+	if got := e.effectiveTokens(msgs); got != EstimateMessagesTokens(msgs)+9000 {
+		t.Errorf("effectiveTokens 未计入 overhead：期望 %d，实际 %d", EstimateMessagesTokens(msgs)+9000, got)
 	}
 	if !e.shouldCompress(msgs) {
 		t.Error("计入 overhead 后应触发压缩，实际未触发——阈值失真问题未修复")
@@ -304,17 +306,24 @@ func TestCompressInPlaceIsIdempotent(t *testing.T) {
 	spill := NewMemorySpillStore()
 	e.SetSpillStore(spill)
 
-	msgs := buildToolHistory(20, 800)
+	msgs := buildToolHistory(20, 1600)
 	once := e.CompressInPlace(context.Background(), msgs)
+	if !e.shouldCompress(msgs) {
+		t.Fatalf("测试前提不成立：%d token 未越 softLimit %d，幂等断言将空转",
+			e.effectiveTokens(msgs), e.softLimit())
+	}
 	firstLen := spill.Len()
+	if firstLen == 0 {
+		t.Fatal("首次压缩未产生 offload，幂等断言将空转")
+	}
 
 	twice := e.CompressInPlace(context.Background(), once)
 	if spill.Len() != firstLen {
 		t.Errorf("二次压缩重复 offload：%d → %d 条", firstLen, spill.Len())
 	}
-	if estimateTokens(twice) != estimateTokens(once) {
+	if EstimateMessagesTokens(twice) != EstimateMessagesTokens(once) {
 		t.Errorf("二次压缩改动了已稳定的序列：%d → %d token",
-			estimateTokens(once), estimateTokens(twice))
+			EstimateMessagesTokens(once), EstimateMessagesTokens(twice))
 	}
 }
 
@@ -363,7 +372,7 @@ func TestMultimodalTokensAreCounted(t *testing.T) {
 			{Type: schema.ChatMessagePartTypeText, Text: "看看这两张图"},
 		},
 	}
-	got := estimateMessageTokens(m)
+	got := EstimateMessageTokens(m)
 	if got < 2*multimodalTokensPerPart {
 		t.Errorf("两个图片分片至少应计 %d token，实际 %d", 2*multimodalTokensPerPart, got)
 	}

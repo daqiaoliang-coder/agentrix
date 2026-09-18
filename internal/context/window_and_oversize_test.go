@@ -51,7 +51,7 @@ func TestSplitByBoundaryKeepsNonEmptyMiddle(t *testing.T) {
 }
 
 // TestSummaryPathExecutesWithSmallWindow 验证 §1 的端到端效果：配小窗口时，
-// Assemble 触发压缩后会写入 state.MemorySummary。summaryModel 为 nil，走规则摘要降级，
+// Assemble 触发压缩后会写入 state.Memory.Summary。summaryModel 为 nil，走规则摘要降级，
 // 但只有 middle 非空才会调用 summarize 并写入——以此证明摘要路径确实执行了。
 func TestSummaryPathExecutesWithSmallWindow(t *testing.T) {
 	e := NewEngine()
@@ -59,8 +59,9 @@ func TestSummaryPathExecutesWithSmallWindow(t *testing.T) {
 	e.SetSpillStore(NewMemorySpillStore())
 
 	state := &session.State{}
-	// 30 条 × 900 字符 ≈ 13500 token，越过 softLimit 触发压缩
-	history := buildToolHistory(30, 900)
+	// 30 条 × 1800 字符（ASCII）≈ 30 × 508 token ≈ 15200，越过 softLimit=13107 触发压缩。
+	// 字符规模按 EstimateTextTokens 的 ASCII 密度 0.28 换算（旧估算为 0.5，高估近 1.8 倍）。
+	history := buildToolHistory(30, 1800)
 	if e.effectiveTokens(history) <= e.softLimit() {
 		t.Fatalf("测试前提不成立：历史 %d token 未越 softLimit %d",
 			e.effectiveTokens(history), e.softLimit())
@@ -69,7 +70,7 @@ func TestSummaryPathExecutesWithSmallWindow(t *testing.T) {
 	if _, err := e.Assemble(context.Background(), "sys", state, history, "继续"); err != nil {
 		t.Fatalf("Assemble: %v", err)
 	}
-	if strings.TrimSpace(state.MemorySummary) == "" {
+	if strings.TrimSpace(state.Memory.Summary) == "" {
 		t.Error("MemorySummary 为空——结构化摘要阶段仍被跳过，§1 未修复")
 	}
 }
@@ -161,8 +162,8 @@ func TestOversizedSamplingIsIdempotent(t *testing.T) {
 	}
 
 	twice := e.CompressInPlace(context.Background(), once)
-	if estimateTokens(twice) != estimateTokens(once) {
-		t.Errorf("二次压缩改动了已采样序列：%d → %d", estimateTokens(once), estimateTokens(twice))
+	if EstimateMessagesTokens(twice) != EstimateMessagesTokens(once) {
+		t.Errorf("二次压缩改动了已采样序列：%d → %d", EstimateMessagesTokens(once), EstimateMessagesTokens(twice))
 	}
 	if spill.Len() != 1 {
 		t.Errorf("二次压缩重复 offload：%d 条", spill.Len())
@@ -219,19 +220,61 @@ func TestOversizedNonIdempotentNotSampledWithoutSpill(t *testing.T) {
 }
 
 // TestSampleWindowScalesWithThreshold 验证采样窗口随阈值自适应，且不超过绝对上限。
+//
+// 断言用「换算出的字符数再估回 token 是否仍在预算内」，而不是假定固定的
+// 字符/token 比——后者正是旧实现失真的根源。两类密度都要成立：
+// ASCII/JSON 类（密度低，字符数多）与中文类（密度高，字符数少）。
 func TestSampleWindowScalesWithThreshold(t *testing.T) {
-	// 大阈值：受绝对上限约束
-	head, tail := sampleWindow(100000)
+	// 大阈值：受绝对上限约束（任何密度下都会被 sampleHeadChars/sampleTailChars 截住）
+	head, tail := sampleWindow(100000, tokensPerASCIIChar)
 	if head != sampleHeadChars || tail != sampleTailChars {
 		t.Errorf("大阈值下应取绝对上限：head=%d tail=%d", head, tail)
 	}
-	// 小阈值：按比例缩放，保证采样后落在阈值以下
-	head2, tail2 := sampleWindow(100)
-	if head2 >= sampleHeadChars || tail2 >= sampleTailChars {
-		t.Errorf("小阈值下应缩小采样窗口：head=%d tail=%d", head2, tail2)
-	}
-	// 采样后头尾 token 之和应 < 阈值（头占阈值一半、尾占四分之一）
-	if head2/2+tail2/2 >= 100 {
-		t.Errorf("采样后仍可能超阈：head=%d tail=%d", head2, tail2)
+
+	for _, tc := range []struct {
+		name    string
+		density float64
+		char    rune // 用于构造该密度的样本内容
+	}{
+		{"ASCII/JSON", tokensPerASCIIChar, 'a'},
+		{"中文", tokensPerCJKChar, '中'},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// 取小阈值，确保按比例缩放真正生效而非触顶。
+			// 触顶条件是 threshold ≥ sampleHeadChars×2×density，这里刻意远低于它。
+			const threshold = 200
+			h, tl := sampleWindow(threshold, tc.density)
+
+			if h >= sampleHeadChars || tl >= sampleTailChars {
+				t.Errorf("小阈值下应缩小采样窗口：head=%d tail=%d", h, tl)
+			}
+			if h < 1 || tl < 1 {
+				t.Fatalf("采样窗口非法：head=%d tail=%d", h, tl)
+			}
+
+			// 核心不变量：头部保留的 token ≈ 阈值的一半，尾部 ≈ 四分之一，均不超预算。
+			// 超预算意味着「采样完仍超阈」，等于白做一次压缩。
+			headTokens := EstimateTextTokens(strings.Repeat(string(tc.char), h))
+			tailTokens := EstimateTextTokens(strings.Repeat(string(tc.char), tl))
+			if headTokens > threshold/2 {
+				t.Errorf("头部超出预算：保留 %d 字符 ≈ %d token > 阈值一半 %d",
+					h, headTokens, threshold/2)
+			}
+			if tailTokens > threshold/4 {
+				t.Errorf("尾部超出预算：保留 %d 字符 ≈ %d token > 阈值四分之一 %d",
+					tl, tailTokens, threshold/4)
+			}
+			if headTokens+tailTokens >= threshold {
+				t.Errorf("采样后仍可能超阈：head=%d tail=%d", headTokens, tailTokens)
+			}
+
+			// 密度非法时回落到最保守值，不 panic、不返回 0
+			for _, bad := range []float64{0, -1, 1.5, 100} {
+				bh, bt := sampleWindow(threshold, bad)
+				if bh < 1 || bt < 1 {
+					t.Errorf("密度 %v 下采样窗口非法：head=%d tail=%d", bad, bh, bt)
+				}
+			}
+		})
 	}
 }

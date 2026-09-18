@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 
+	"github.com/cloudwego/eino/callbacks"
 	einotool "github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
@@ -94,20 +96,29 @@ func NewAgent(
 }
 
 // readResultMaxChars 是 read_result 单次回读的字符上限，防止一条超大结果回读后
-// 又把上下文顶爆（对应设计中的「read_result 页上限」）。约 25k token（2 字符/token）。
+// 又把上下文顶爆（对应设计中的「read_result 页上限」）。
+//
+// 按 EstimateTextTokens 的密度换算，5 万字符约等于 1.4 万 token（ASCII/JSON）
+// 到 3.5 万 token（中文）。此前注释按「2 字符/token」估成约 25k token，
+// 对工具结果这种以 JSON 为主的内容偏高近一倍——而偏高的估算会让人误以为
+// 还有余量，从而把这个上限设得过大。
 const readResultMaxChars = 50000
 
 // computeOverhead 计算固定开销快照。
-// 工具 schema 用 Info() 的 JSON 序列化长度估算，与消息体共用同一套粗略 token 估算
-// （estimateTextLen，约 2 字符/token）。该估算对 ASCII 偏保守（高估），
-// 生产环境建议替换为 tiktoken 精确计量。
+//
+// 工具 schema 用 Info() 的 JSON 序列化长度估算，与消息体共用
+// ctxengine.EstimateTextTokens 这唯一一套估算口径。
+//
+// 这一点是压缩决策正确性的前提：overhead 与消息本体分别用不同公式估算时，
+// effectiveTokens 的两部分误差方向可能相反，softLimit 就变成一条位置不明的线——
+// 压缩可能在远未接近窗口时触发（白白作废缓存前缀），也可能在真要爆窗时才触发。
 func computeOverhead(
 	ctx context.Context,
 	systemPrompt string,
 	tools []einotool.BaseTool,
 ) ctxengine.PromptOverheadSnapshot {
 	snap := ctxengine.PromptOverheadSnapshot{
-		SystemTokens: estimateTextLen(systemPrompt),
+		SystemTokens: ctxengine.EstimateTextTokens(systemPrompt),
 	}
 	for _, t := range tools {
 		if t == nil {
@@ -118,13 +129,66 @@ func computeOverhead(
 			continue
 		}
 		if raw, mErr := json.Marshal(info); mErr == nil {
-			snap.ToolsTokens += estimateTextLen(string(raw))
+			snap.ToolsTokens += ctxengine.EstimateTextTokens(string(raw))
 		} else {
 			// 序列化失败时退化为按名称+描述估算，不阻断装配
-			snap.ToolsTokens += estimateTextLen(info.Name) + estimateTextLen(info.Desc)
+			snap.ToolsTokens += ctxengine.EstimateTextTokens(info.Name) + ctxengine.EstimateTextTokens(info.Desc)
 		}
 	}
 	return snap
+}
+
+// toolMsgCollector 通过 eino callbacks 捕获图内的工具交互，补齐 RawHistory 审计完整性。
+//
+// 过滤规则：只收 ToolsNode 组件的回调——
+//   - OnStart 输入为携带 tool_calls 的 assistant 消息（工具调用发起侧）；
+//   - OnEnd 输出为 []*schema.Message 的 tool 结果消息（工具结果回填侧）。
+//
+// 多轮 ReAct 时按时间顺序收集：[assistant_tc, results, assistant_tc2, results2, ...]。
+// 仅在 Invoke 成功后消费；中断/失败路径丢弃，避免 Resume 重放同一段交互造成重复追加
+// （中断点前的历史轮次不入审计，装配阶段由 Engine 的 tool 配对修复逻辑兜底）。
+type toolMsgCollector struct {
+	mu   sync.Mutex
+	msgs []*schema.Message
+}
+
+func newToolMsgCollector() *toolMsgCollector {
+	return &toolMsgCollector{}
+}
+
+func (c *toolMsgCollector) handler() callbacks.Handler {
+	return callbacks.NewHandlerBuilder().
+		OnStartFn(func(ctx context.Context, info *callbacks.RunInfo, input callbacks.CallbackInput) context.Context {
+			if info == nil || info.Component != compose.ComponentOfToolsNode {
+				return ctx
+			}
+			if m, ok := input.(*schema.Message); ok && m != nil && len(m.ToolCalls) > 0 {
+				c.mu.Lock()
+				c.msgs = append(c.msgs, m)
+				c.mu.Unlock()
+			}
+			return ctx
+		}).
+		OnEndFn(func(ctx context.Context, info *callbacks.RunInfo, output callbacks.CallbackOutput) context.Context {
+			if info == nil || info.Component != compose.ComponentOfToolsNode {
+				return ctx
+			}
+			if msgs, ok := output.([]*schema.Message); ok && len(msgs) > 0 {
+				c.mu.Lock()
+				c.msgs = append(c.msgs, msgs...)
+				c.mu.Unlock()
+			}
+			return ctx
+		}).
+		Build()
+}
+
+func (c *toolMsgCollector) snapshot() []*schema.Message {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]*schema.Message, len(c.msgs))
+	copy(out, c.msgs)
+	return out
 }
 
 // Run 执行一次 Turn
@@ -201,26 +265,35 @@ func (a *Agent) run(
 	//
 	// ForceNewRun 只用于全新 Turn，避免误从上一轮残留的检查点恢复；
 	// 恢复模式必须省略它，否则中断状态被丢弃。
+	//
+	// toolMsgCollector 挂在图回调上捕获工具交互，供 ⑥ 追加进 RawHistory。
+	capture := newToolMsgCollector()
 	invokeOpts := []compose.Option{compose.WithCheckPointID(sessionID)}
 	if !resuming {
 		invokeOpts = append(invokeOpts, compose.WithForceNewRun())
 	}
+	invokeOpts = append(invokeOpts, compose.WithCallbacks(capture.handler()))
 	output, err := a.runnable.Invoke(ctx, messages, invokeOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("invoke agent: %w", err)
 	}
 
-	// ⑥ 更新 SessionState 和 RawHistory
-	//    恢复模式没有新的用户输入，只追加模型输出，避免写入空 user 消息。
-	if resuming {
-		history = append(history, output)
-	} else {
-		history = append(history, schema.UserMessage(userInput), output)
+	// ⑥ 追加 RawHistory（append-only）：user 输入 → 图内工具交互 → 最终输出
+	//    恢复模式没有新的用户输入，跳过 user 消息避免写入空记录。
+	newMsgs := make([]*schema.Message, 0, len(capture.msgs)+2)
+	if !resuming {
+		newMsgs = append(newMsgs, schema.UserMessage(userInput))
 	}
-	if err := a.store.SaveHistory(ctx, sessionID, history); err != nil {
-		return nil, fmt.Errorf("save history: %w", err)
+	newMsgs = append(newMsgs, capture.snapshot()...)
+	newMsgs = append(newMsgs, output)
+	lastSeq, err := a.store.AppendHistory(ctx, sessionID, newMsgs...)
+	if err != nil {
+		return nil, fmt.Errorf("append history: %w", err)
 	}
-	state.UpdateFromTurn(messages, output)
+
+	// 游标指向本次追加的最后一条记录 seq（本 Turn 已全量消费历史）
+	state.UpdateFromTurn()
+	state.HistoryCursor = int(lastSeq)
 	if err := a.store.SaveState(ctx, sessionID, state); err != nil {
 		return nil, fmt.Errorf("save state: %w", err)
 	}

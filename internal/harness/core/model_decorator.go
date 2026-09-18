@@ -81,8 +81,24 @@ func (m *BudgetModel) Generate(
 	}
 
 	// ③ 上下文循环内压缩（规则裁剪，不调 LLM；仅越 softLimit 才触发）
+	//
+	// 用 WithStats 变体取回账本并按 Turn 记入 Budget，而不是依赖 Engine.OnCompacted：
+	// Engine 是跨 Turn 共享的单例，钩子只能指向一个目标，并发 Turn 会串号；
+	// Budget 经 ctx 传入、天然按 Turn 隔离，记在它身上才是对的归属。
 	if m.cfg.Engine != nil {
-		input = m.cfg.Engine.CompressInPlace(ctx, input)
+		var stats ctxengine.CompressStats
+		input, stats = m.cfg.Engine.CompressInPlaceWithStats(ctx, input)
+		// 只在真的改写了序列时记账：未越阈值的轮次占绝大多数，
+		// 全记进去会让 CompressEvents 退化成「模型调用次数」，
+		// 失去「压缩触发频率」这个指标的意义。
+		if hasBudget && stats.Triggered {
+			b.RecordCompaction(
+				stats.TokensSaved(),
+				stats.NetTokensSaved(),
+				stats.SummaryTokens,
+				stats.UnrecoverableLost,
+			)
+		}
 	}
 
 	// ④ 带重试的模型调用
@@ -219,17 +235,25 @@ func (m *BudgetModel) WithTools(tools []*schema.ToolInfo) (model.ToolCallingChat
 // ----------------------------------------------------------------------------
 
 // recordUsage 从输出提取 token 用量并消费预算；缺失时按估算兜底。
+//
+// 缓存明细取自 eino 的 Usage.PromptTokenDetails.CachedTokens——provider 返回了就
+// 原样带入，没返回则为 0。CachedTokens 是 PromptTokens 的子集，ConsumeTokens 内部
+// 只把它累计进观测量、不计入 UsedTokens，因此预算判定口径不受影响。
 func (m *BudgetModel) recordUsage(b *budget.Budget, input []*schema.Message, out *schema.Message) {
 	if out.ResponseMeta != nil && out.ResponseMeta.Usage != nil {
+		u := out.ResponseMeta.Usage
 		_ = b.ConsumeTokens(budget.TokenUsage{
-			PromptTokens:     out.ResponseMeta.Usage.PromptTokens,
-			CompletionTokens: out.ResponseMeta.Usage.CompletionTokens,
-			TotalTokens:      out.ResponseMeta.Usage.TotalTokens,
+			PromptTokens:     u.PromptTokens,
+			CompletionTokens: u.CompletionTokens,
+			TotalTokens:      u.TotalTokens,
+			CachedTokens:     u.PromptTokenDetails.CachedTokens,
 		})
 		return
 	}
-	// 估算兜底：输出 + 输入粗略 token
-	est := estimateTokensForMessages(input) + estimateTextLen(out.Content)
+	// 估算兜底：输出 + 输入粗略 token。
+	// 注意这条路径不含缓存明细，HasUsageData 会为 false——
+	// 此时缓存命中率应视为「未采到」，而不是「命中率为零」。
+	est := ctxengine.EstimateMessagesTokens(input) + ctxengine.EstimateTextTokens(out.Content)
 	_ = b.ConsumeTokens(budget.TokenUsage{TotalTokens: est})
 }
 
@@ -330,26 +354,8 @@ func containsAny(s string, subs ...string) bool {
 	return false
 }
 
-// estimateTokensForMessages 与 estimateTextLen 复用 context 包的估算逻辑。
-// 这里提供轻量本地实现，避免跨包导出未导出的估算函数。
-func estimateTokensForMessages(msgs []*schema.Message) int {
-	total := 0
-	for _, m := range msgs {
-		if m == nil {
-			continue
-		}
-		total += estimateTextLen(m.Content)
-		for _, tc := range m.ToolCalls {
-			total += estimateTextLen(tc.Function.Name) + estimateTextLen(tc.Function.Arguments)
-		}
-		total += 4
-	}
-	return total
-}
-
-func estimateTextLen(s string) int {
-	if s == "" {
-		return 0
-	}
-	return len([]rune(s))/2 + 1
-}
+// token 估算统一由 internal/context 包提供（EstimateMessagesTokens / EstimateTextTokens）。
+//
+// 此前这里另有一份本地实现，与 context 包并行维护同一个概念。两份实现的分叉
+// 不只是代码冗余：压缩决策用 context 的尺子、用量记账用这里的尺子，同一段文本
+// 在两处得到不同的 token 数，「省了多少」和「花了多少」就对不上账。
