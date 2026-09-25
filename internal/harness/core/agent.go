@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"sync"
+	"time"
 
 	"github.com/cloudwego/eino/callbacks"
 	einotool "github.com/cloudwego/eino/components/tool"
@@ -14,6 +16,7 @@ import (
 	ctxengine "github.com/daqiaoliang-coder/agentrix/internal/context"
 	"github.com/daqiaoliang-coder/agentrix/internal/harness/budget"
 	"github.com/daqiaoliang-coder/agentrix/internal/harness/hitl"
+	"github.com/daqiaoliang-coder/agentrix/internal/projection"
 	"github.com/daqiaoliang-coder/agentrix/internal/scene"
 	"github.com/daqiaoliang-coder/agentrix/internal/session"
 	"github.com/daqiaoliang-coder/agentrix/internal/tool/builtin"
@@ -159,28 +162,46 @@ func newToolMsgCollector() *toolMsgCollector {
 func (c *toolMsgCollector) handler() callbacks.Handler {
 	return callbacks.NewHandlerBuilder().
 		OnStartFn(func(ctx context.Context, info *callbacks.RunInfo, input callbacks.CallbackInput) context.Context {
-			if info == nil || info.Component != compose.ComponentOfToolsNode {
-				return ctx
-			}
-			if m, ok := input.(*schema.Message); ok && m != nil && len(m.ToolCalls) > 0 {
-				c.mu.Lock()
-				c.msgs = append(c.msgs, m)
-				c.mu.Unlock()
-			}
+			c.collectStart(info, input)
+			return ctx
+		}).
+		OnStartWithStreamInputFn(func(ctx context.Context, info *callbacks.RunInfo, input *schema.StreamReader[callbacks.CallbackInput]) context.Context {
+			c.collectStart(info, drainInputMessages(input))
 			return ctx
 		}).
 		OnEndFn(func(ctx context.Context, info *callbacks.RunInfo, output callbacks.CallbackOutput) context.Context {
-			if info == nil || info.Component != compose.ComponentOfToolsNode {
-				return ctx
-			}
-			if msgs, ok := output.([]*schema.Message); ok && len(msgs) > 0 {
-				c.mu.Lock()
-				c.msgs = append(c.msgs, msgs...)
-				c.mu.Unlock()
-			}
+			c.collectEnd(info, output)
+			return ctx
+		}).
+		OnEndWithStreamOutputFn(func(ctx context.Context, info *callbacks.RunInfo, output *schema.StreamReader[callbacks.CallbackOutput]) context.Context {
+			c.collectEnd(info, drainOutputMessages(output))
 			return ctx
 		}).
 		Build()
+}
+
+// collectStart/collectEnd 是普通与流式时机共用的收集逻辑。
+// 流式模式下工具节点输入是增量帧，已由 drain 拼接还原为完整消息。
+func (c *toolMsgCollector) collectStart(info *callbacks.RunInfo, input callbacks.CallbackInput) {
+	if info == nil || info.Component != compose.ComponentOfToolsNode {
+		return
+	}
+	if m, ok := input.(*schema.Message); ok && m != nil && len(m.ToolCalls) > 0 {
+		c.mu.Lock()
+		c.msgs = append(c.msgs, m)
+		c.mu.Unlock()
+	}
+}
+
+func (c *toolMsgCollector) collectEnd(info *callbacks.RunInfo, output callbacks.CallbackOutput) {
+	if info == nil || info.Component != compose.ComponentOfToolsNode {
+		return
+	}
+	if msgs, ok := output.([]*schema.Message); ok && len(msgs) > 0 {
+		c.mu.Lock()
+		c.msgs = append(c.msgs, msgs...)
+		c.mu.Unlock()
+	}
 }
 
 func (c *toolMsgCollector) snapshot() []*schema.Message {
@@ -197,7 +218,18 @@ func (a *Agent) Run(
 	sessionID string,
 	userInput string,
 ) (*schema.Message, error) {
-	return a.run(ctx, sessionID, userInput, false)
+	return a.run(ctx, sessionID, userInput, false, nil)
+}
+
+// RunStream 与 Run 行为一致，额外通过 sink 实时推出过程信号（projection.Signal）。
+// sink 在图回调里被调用，须快速返回；需要慢消费（如网络推送）时自行缓冲。
+func (a *Agent) RunStream(
+	ctx context.Context,
+	sessionID string,
+	userInput string,
+	sink func(projection.Signal),
+) (*schema.Message, error) {
+	return a.run(ctx, sessionID, userInput, false, sink)
 }
 
 // Resume 从 HITL 中断点恢复执行。
@@ -211,15 +243,29 @@ func (a *Agent) Resume(
 	decision *hitl.ApprovalDecision,
 ) (*schema.Message, error) {
 	resumeCtx := hitl.ResumeWithDecision(ctx, interruptID, decision)
-	return a.run(resumeCtx, sessionID, "", true)
+	return a.run(resumeCtx, sessionID, "", true, nil)
 }
 
-// run 是 Run/Resume 的共享实现。resuming 为 true 时从检查点恢复而非重新开始。
+// ResumeStream 是 Resume 的流式变体，恢复执行的过程信号经 sink 推出。
+func (a *Agent) ResumeStream(
+	ctx context.Context,
+	sessionID string,
+	interruptID string,
+	decision *hitl.ApprovalDecision,
+	sink func(projection.Signal),
+) (*schema.Message, error) {
+	resumeCtx := hitl.ResumeWithDecision(ctx, interruptID, decision)
+	return a.run(resumeCtx, sessionID, "", true, sink)
+}
+
+// run 是 Run/Resume 及各自流式变体的共享实现。resuming 为 true 时从检查点
+// 恢复而非重新开始；sink 非 nil 时发射过程信号，为 nil 时信号发射零成本。
 func (a *Agent) run(
 	ctx context.Context,
 	sessionID string,
 	userInput string,
 	resuming bool,
+	sink func(projection.Signal),
 ) (*schema.Message, error) {
 
 	// ① 外层超时（双层超时之外层）：覆盖整个 Turn 的总时间预算
@@ -235,6 +281,9 @@ func (a *Agent) run(
 		b.WithDeadline(a.cfg.TotalTimeout)
 	}
 	ctx = budget.WithBudget(ctx, b)
+
+	emitter := projection.NewEmitter(sessionID, fmt.Sprintf("turn_%d", time.Now().UnixNano()), sink)
+	emitter.Emit(projection.TurnStart, map[string]any{"input": userInput, "resuming": resuming})
 
 	// ③ 加载 SessionState + RawHistory
 	state, err := a.store.LoadState(ctx, sessionID)
@@ -267,14 +316,27 @@ func (a *Agent) run(
 	// 恢复模式必须省略它，否则中断状态被丢弃。
 	//
 	// toolMsgCollector 挂在图回调上捕获工具交互，供 ⑥ 追加进 RawHistory。
+	// 流式模式下追加 signalCallback，把同一批回调翻译为过程信号。
 	capture := newToolMsgCollector()
 	invokeOpts := []compose.Option{compose.WithCheckPointID(sessionID)}
 	if !resuming {
 		invokeOpts = append(invokeOpts, compose.WithForceNewRun())
 	}
-	invokeOpts = append(invokeOpts, compose.WithCallbacks(capture.handler()))
-	output, err := a.runnable.Invoke(ctx, messages, invokeOpts...)
+	handlers := []callbacks.Handler{capture.handler()}
+	if sink != nil {
+		handlers = append(handlers, newSignalCallback(emitter).handler())
+	}
+	invokeOpts = append(invokeOpts, compose.WithCallbacks(handlers...))
+
+	// 流式模式（sink != nil）走 runnable.Stream：模型节点以流式产出，
+	// signalCallback 经 OnEndWithStreamOutput 逐帧发射 llm_token；
+	// 图输出流拼接后还原最终消息，与 Invoke 路径语义一致。
+	output, err := a.execute(ctx, messages, sink != nil, invokeOpts)
 	if err != nil {
+		// 审批中断也是运行事实：让外层能实时感知「正在等待人工授权」
+		if approval, ok := ExtractApprovalRequired(err); ok {
+			emitter.Emit(projection.ApproveRequested, approval.Request)
+		}
 		return nil, fmt.Errorf("invoke agent: %w", err)
 	}
 
@@ -298,5 +360,46 @@ func (a *Agent) run(
 		return nil, fmt.Errorf("save state: %w", err)
 	}
 
+	emitter.Emit(projection.TurnEnd, map[string]any{"content_length": len(output.Content)})
 	return output, nil
+}
+
+// execute 按模式执行图：同步走 Invoke；流式走 Stream 并读空输出流、
+// 拼接帧还原最终消息。流式模式下运行时错误（含审批中断）经输出流的
+// Recv 返回，与 Invoke 的返回错误统一处理。
+func (a *Agent) execute(
+	ctx context.Context,
+	messages []*schema.Message,
+	stream bool,
+	opts []compose.Option,
+) (*schema.Message, error) {
+	if !stream {
+		return a.runnable.Invoke(ctx, messages, opts...)
+	}
+	sr, err := a.runnable.Stream(ctx, messages, opts...)
+	if err != nil {
+		return nil, err
+	}
+	defer sr.Close()
+	var frames []*schema.Message
+	for {
+		frame, recvErr := sr.Recv()
+		if recvErr == io.EOF {
+			break
+		}
+		if recvErr != nil {
+			return nil, recvErr
+		}
+		if frame != nil {
+			frames = append(frames, frame)
+		}
+	}
+	if len(frames) == 0 {
+		return nil, fmt.Errorf("agent stream produced no output")
+	}
+	out, err := schema.ConcatMessages(frames)
+	if err != nil {
+		return nil, fmt.Errorf("concat stream output: %w", err)
+	}
+	return out, nil
 }

@@ -27,6 +27,7 @@ func main() {
 	handler := api.NewHandler(registry, store)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/chat", handler.Chat)
+	mux.HandleFunc("/chat/stream", handler.ChatStream) // SSE：实时推送过程信号
 
 	log.Println("agentrix listening on :8080")
 	log.Fatal(http.ListenAndServe(":8080", mux))

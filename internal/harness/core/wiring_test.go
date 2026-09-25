@@ -27,18 +27,48 @@ type scriptModel struct {
 	boundTools []*schema.ToolInfo
 }
 
-func (m *scriptModel) Generate(_ context.Context, _ []*schema.Message, _ ...model.Option) (*schema.Message, error) {
+func (m *scriptModel) record() *schema.Message {
 	m.seenTools = append(m.seenTools, boundToolNames(m.boundTools))
 	if m.call >= len(m.replies) {
-		return schema.AssistantMessage("done", nil), nil
+		return schema.AssistantMessage("done", nil)
 	}
 	out := m.replies[m.call]
 	m.call++
-	return out, nil
+	return out
 }
 
+func (m *scriptModel) Generate(_ context.Context, _ []*schema.Message, _ ...model.Option) (*schema.Message, error) {
+	return m.record(), nil
+}
+
+// Stream 模拟真实模型的 token 流：Content 切为增量帧逐帧返回，
+// ToolCalls 整体置于末帧（真实模型的工具调用也以整段收尾）。
+// 帧式产出是 llm_token 信号测试的前提。
 func (m *scriptModel) Stream(_ context.Context, _ []*schema.Message, _ ...model.Option) (*schema.StreamReader[*schema.Message], error) {
-	return nil, context.DeadlineExceeded
+	return schema.StreamReaderFromArray(chunkFrames(m.record(), 4)), nil
+}
+
+// chunkFrames 把完整消息切成流式帧：正文按 n 字符切分，工具调用并入末帧。
+func chunkFrames(msg *schema.Message, n int) []*schema.Message {
+	if msg == nil {
+		return nil
+	}
+	content := []rune(msg.Content)
+	var frames []*schema.Message
+	for i := 0; i < len(content); i += n {
+		end := i + n
+		if end > len(content) {
+			end = len(content)
+		}
+		frames = append(frames, schema.AssistantMessage(string(content[i:end]), nil))
+	}
+	if len(frames) == 0 {
+		frames = append(frames, schema.AssistantMessage("", nil))
+	}
+	if len(msg.ToolCalls) > 0 {
+		frames[len(frames)-1].ToolCalls = msg.ToolCalls
+	}
+	return frames
 }
 
 func (m *scriptModel) WithTools(tools []*schema.ToolInfo) (model.ToolCallingChatModel, error) {
