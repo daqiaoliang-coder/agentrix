@@ -41,6 +41,42 @@ func NewAgent(
 	cfg *scene.SceneConfig,
 	store session.Store,
 ) (*Agent, error) {
+	// 框架工具：artifact 读写 + 子代理派生。均不经 Catalog 白名单过滤
+	// （FilterTools 对未登记工具放行），与 read_skill / read_result 同等待遇。
+	var extra []einotool.BaseTool
+
+	artifactStore := resolveArtifactStore(cfg)
+	extra = append(extra,
+		builtin.NewWriteArtifactTool(artifactStore),
+		builtin.NewReadArtifactTool(artifactStore),
+	)
+
+	// 子代理工具：按 key 排序保证工具顺序稳定（map 遍历无序会让系统提示抖动）
+	for _, key := range sortedSubagentKeys(cfg.Subagents) {
+		st, err := newSubagentTool(ctx, key, cfg.Subagents[key], store)
+		if err != nil {
+			return nil, fmt.Errorf("build subagent %q: %w", key, err)
+		}
+		extra = append(extra, st)
+	}
+
+	engine, assembled, r, err := buildRuntime(ctx, cfg, extra)
+	if err != nil {
+		return nil, err
+	}
+	return &Agent{cfg: cfg, runnable: r, store: store, engine: engine, assembled: assembled}, nil
+}
+
+// buildRuntime 装配单个场景的运行时：压缩引擎 → 场景装配 → 框架工具追加 →
+// 开销快照 → BudgetModel 装饰 → 图编译。NewAgent 与 subagentTool 共用，
+// 保证子代理与顶层 Agent 走完全一致的治理链路（审批/白名单/预算/压缩）。
+// extra 为调用方追加的框架工具（顶层 Agent 的 artifact/子代理工具）；
+// 子代理构建时传 nil，天然阻断嵌套派生。
+func buildRuntime(
+	ctx context.Context,
+	cfg *scene.SceneConfig,
+	extra []einotool.BaseTool,
+) (*ctxengine.Engine, *scene.AssembleResult, compose.Runnable[[]*schema.Message, *schema.Message], error) {
 	// 装配上下文压缩引擎：用 SceneConfig 的 TokenBudget/CompressThreshold 调参
 	engine := ctxengine.NewEngine()
 	if cfg.TokenBudget > 0 {
@@ -54,11 +90,11 @@ func NewAgent(
 	// 必须先于开销快照计算：快照要基于装配后的真实系统提示与最终工具集。
 	assembled, err := cfg.Assemble(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("assemble scene: %w", err)
+		return nil, nil, nil, fmt.Errorf("assemble scene: %w", err)
 	}
 
 	// 溢出存储：承接被压缩淘汰的工具结果原文，使淘汰「可恢复」而非「删除」。
-	// 进程内实现，作用域为单个 Agent 实例（即单次 Turn 的 ReAct 循环）；
+	// 进程内实现，作用域为单个运行时（即单次 Turn 的 ReAct 循环）；
 	// 生产环境可替换为对象存储实现以支持跨 Turn 回读。
 	spill := ctxengine.NewMemorySpillStore()
 	engine.SetSpillStore(spill)
@@ -66,6 +102,7 @@ func NewAgent(
 	// 回读工具：与淘汰逻辑闭环。模型看到 stub 后可凭 tool_call_id 取回原文。
 	// 作为框架工具追加，不经 Catalog 白名单过滤（与 read_skill 同等待遇）。
 	assembled.Tools = append(assembled.Tools, builtin.NewReadResultTool(spill, readResultMaxChars))
+	assembled.Tools = append(assembled.Tools, extra...)
 
 	// 写/非幂等工具标记：复用 Catalog 的 NeedsApproval（写类命令）作为判定依据。
 	// 这类工具结果无法重放，淘汰即永久丢失，故排除在淘汰之外。
@@ -93,9 +130,32 @@ func NewAgent(
 
 	r, err := BuildAgentGraph(ctx, decorated, assembled.Tools, cfg.MaxIterations)
 	if err != nil {
-		return nil, fmt.Errorf("build graph: %w", err)
+		return nil, nil, nil, fmt.Errorf("build graph: %w", err)
 	}
-	return &Agent{cfg: cfg, runnable: r, store: store, engine: engine, assembled: assembled}, nil
+	return engine, assembled, r, nil
+}
+
+// artifactStores 按场景共享进程内 ArtifactStore：SceneConfig 未显式配置时，
+// 同一场景的多轮、多 Agent 实例共享同一存储，artifact 才能跨轮累积。
+var artifactStores sync.Map // sceneKey -> projection.ArtifactStore
+
+func resolveArtifactStore(cfg *scene.SceneConfig) projection.ArtifactStore {
+	if cfg.ArtifactStore != nil {
+		return cfg.ArtifactStore
+	}
+	actual, _ := artifactStores.LoadOrStore(cfg.Key, projection.NewMemoryArtifactStore())
+	return actual.(projection.ArtifactStore)
+}
+
+// RegisteredArtifactStores 返回所有已解析的默认 ArtifactStore 快照，
+// 供 API 层按会话列举 artifact（显式配置的 cfg.ArtifactStore 由调用方自管）。
+func RegisteredArtifactStores() []projection.ArtifactStore {
+	var out []projection.ArtifactStore
+	artifactStores.Range(func(_, v any) bool {
+		out = append(out, v.(projection.ArtifactStore))
+		return true
+	})
+	return out
 }
 
 // readResultMaxChars 是 read_result 单次回读的字符上限，防止一条超大结果回读后
@@ -282,7 +342,12 @@ func (a *Agent) run(
 	}
 	ctx = budget.WithBudget(ctx, b)
 
-	emitter := projection.NewEmitter(sessionID, fmt.Sprintf("turn_%d", time.Now().UnixNano()), sink)
+	// Turn 归属信息注入 ctx：write_artifact / spawn_* 等框架工具在图回调深处
+	// 凭它取回 sessionID/turnID，避免让模型自报归属。
+	turnID := fmt.Sprintf("turn_%d", time.Now().UnixNano())
+	ctx = projection.WithTurnScope(ctx, sessionID, turnID)
+
+	emitter := projection.NewEmitter(sessionID, turnID, sink)
 	emitter.Emit(projection.TurnStart, map[string]any{"input": userInput, "resuming": resuming})
 
 	// ③ 加载 SessionState + RawHistory

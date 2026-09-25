@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"sync"
 
 	"github.com/cloudwego/eino/schema"
@@ -164,4 +165,26 @@ func (h *Handler) ChatStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeEvent("result", map[string]string{"content": output.Content})
+}
+
+// Artifacts 处理 GET /sessions/{session}/artifacts：列举某会话产生的全部
+// artifact。artifact 按 SessionID 归属存储，会话与场景无映射关系，故跨
+// 所有已注册的默认存储汇总过滤。输出按创建时间排序，保证分页/ diff 稳定。
+func (h *Handler) Artifacts(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.PathValue("session")
+	if sessionID == "" {
+		http.Error(w, "session is required", http.StatusBadRequest)
+		return
+	}
+	out := make([]*projection.Artifact, 0)
+	for _, s := range core.RegisteredArtifactStores() {
+		arts, err := s.ListBySession(r.Context(), sessionID)
+		if err != nil {
+			continue
+		}
+		out = append(out, arts...)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
 }

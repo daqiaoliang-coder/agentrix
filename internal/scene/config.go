@@ -6,6 +6,7 @@ import (
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool"
 
+	"github.com/daqiaoliang-coder/agentrix/internal/projection"
 	"github.com/daqiaoliang-coder/agentrix/internal/skill"
 	agenttool "github.com/daqiaoliang-coder/agentrix/internal/tool"
 )
@@ -46,4 +47,15 @@ type SceneConfig struct {
 	// NoProgressLimit 无进展检测阈值：连续 N 轮工具调用签名相同则注入收尾提示。
 	// 零值表示禁用无进展检测。
 	NoProgressLimit int
+
+	// ArtifactStore 是该场景的 artifact 存储（write_artifact / read_artifact 工具的后端）。
+	// nil 时回退为进程内 MemoryArtifactStore，且同一场景（按 Key）共享同一实例，
+	// 使 artifact 能跨轮、跨 Agent 实例累积；生产环境可替换为持久化实现。
+	ArtifactStore projection.ArtifactStore
+
+	// Subagents 声明该场景可派生的子代理：key 为子代理标识，value 为子场景配置。
+	// 装配时每个子代理注册为 spawn_<key> 工具，模型可下发独立子任务。
+	// 子代理以独立会话（父会话::key）同步执行，不向父 SSE 流信号；
+	// 子场景自身的 Subagents 字段被忽略，不允许嵌套派生。
+	Subagents map[string]*SceneConfig
 }

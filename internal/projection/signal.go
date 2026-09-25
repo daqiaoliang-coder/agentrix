@@ -14,6 +14,8 @@ const (
 	ToolEnd          SignalType = "tool_end"
 	ApproveRequested SignalType = "approve_requested"
 	ContextCompacted SignalType = "context_compacted"
+	ArtifactNew      SignalType = "artifact_new"
+	ArtifactUpdated  SignalType = "artifact_updated"
 )
 
 // Signal 是运行事实，不是 UI 文案，也不是模型上下文。它的目标是让外层系统观察 Agent 正在发生什么。

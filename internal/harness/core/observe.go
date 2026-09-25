@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 
 	"github.com/cloudwego/eino/callbacks"
@@ -10,6 +11,7 @@ import (
 	"github.com/cloudwego/eino/schema"
 
 	"github.com/daqiaoliang-coder/agentrix/internal/projection"
+	"github.com/daqiaoliang-coder/agentrix/internal/tool/builtin"
 )
 
 // signalCallback 把图内回调翻译为过程信号（projection.Signal）。
@@ -137,7 +139,35 @@ func (c *signalCallback) emitToolEnd(output callbacks.CallbackOutput) {
 			"call_id": m.ToolCallID,
 			"result":  truncateRunes(m.Content, 2000),
 		})
+		c.maybeEmitArtifact(m)
 	}
+}
+
+// maybeEmitArtifact 在 write_artifact 成功后补发 artifact_new / artifact_updated
+// 信号，让外层无需轮询存储即可感知产物变更。工具结果 JSON 契约由
+// builtin.writeArtifactResult 定义，解析失败按普通工具处理，不影响主链路。
+func (c *signalCallback) maybeEmitArtifact(m *schema.Message) {
+	if m.ToolName != builtin.ToolWriteArtifact {
+		return
+	}
+	var res struct {
+		ArtifactID string `json:"artifact_id"`
+		Type       string `json:"type"`
+		Title      string `json:"title"`
+		Updated    bool   `json:"updated"`
+	}
+	if err := json.Unmarshal([]byte(m.Content), &res); err != nil || res.ArtifactID == "" {
+		return
+	}
+	typ := projection.ArtifactNew
+	if res.Updated {
+		typ = projection.ArtifactUpdated
+	}
+	c.emitter.Emit(typ, map[string]any{
+		"artifact_id":   res.ArtifactID,
+		"artifact_type": res.Type,
+		"title":         res.Title,
+	})
 }
 
 func (c *signalCallback) emitLLMEnd(output callbacks.CallbackOutput) {
