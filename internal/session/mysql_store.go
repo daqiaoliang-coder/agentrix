@@ -32,13 +32,16 @@ func NewMySQLStore(db *sql.DB) *MySQLStore {
 	return &MySQLStore{db: db}
 }
 
-// NewMySQLStoreFromDSN 从 DSN 创建 MySQLStore，并完成连接池初始化与连通性探测。
+// OpenMySQLDB 打开并探测一个 MySQL 连接池。
 // DSN 格式参考 go-sql-driver/mysql：
 //
 //	user:pass@tcp(127.0.0.1:3306)/dbname?parseTime=true&loc=Local
 //
 // parseTime=true 是必须的，否则 DATETIME 列无法扫描为 time.Time。
-func NewMySQLStoreFromDSN(dsn string) (*MySQLStore, error) {
+//
+// 多个存储（session.MySQLStore、hitl.MySQLCheckPointStore）应共享同一
+// *sql.DB，避免同一进程对同一库维护多份连接池。
+func OpenMySQLDB(dsn string) (*sql.DB, error) {
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open mysql: %w", err)
@@ -52,6 +55,16 @@ func NewMySQLStoreFromDSN(dsn string) (*MySQLStore, error) {
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("ping mysql: %w", err)
+	}
+	return db, nil
+}
+
+// NewMySQLStoreFromDSN 从 DSN 创建 MySQLStore（自带独立连接池）。
+// 若同进程还需要其他 MySQL 存储，改用 OpenMySQLDB + NewMySQLStore 共享连接池。
+func NewMySQLStoreFromDSN(dsn string) (*MySQLStore, error) {
+	db, err := OpenMySQLDB(dsn)
+	if err != nil {
+		return nil, err
 	}
 	return &MySQLStore{db: db}, nil
 }

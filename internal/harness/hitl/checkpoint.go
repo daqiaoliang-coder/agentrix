@@ -28,18 +28,35 @@ func NewMemoryCheckPointStore() *MemoryCheckPointStore {
 // NewAgent → BuildAgentGraph。若每次建图都新建存储，审批中断时写入的
 // Checkpoint 会在恢复请求到来前随旧图一起被丢弃，Resume 必然失败。
 //
-// 生产环境应替换为持久化实现（DB/Redis）以支持多副本部署；
-// 内存版仅适用于单进程。
+// 默认回退为内存实现（单进程）；生产环境应在启动时经
+// SetDefaultCheckPointStore 注入持久化实现（如 MySQLCheckPointStore），
+// 以支持进程重启与多副本部署下的审批恢复。
 var (
-	defaultStoreOnce sync.Once
-	defaultStore     *MemoryCheckPointStore
+	defaultMu     sync.RWMutex
+	defaultShared CheckPointStore
 )
 
-func DefaultCheckPointStore() *MemoryCheckPointStore {
-	defaultStoreOnce.Do(func() {
-		defaultStore = NewMemoryCheckPointStore()
-	})
-	return defaultStore
+// SetDefaultCheckPointStore 注入进程级共享的检查点存储实现。
+// 必须在首次构建图（NewAgent）之前调用；运行时重复调用以最后一次为准。
+func SetDefaultCheckPointStore(s CheckPointStore) {
+	defaultMu.Lock()
+	defer defaultMu.Unlock()
+	defaultShared = s
+}
+
+func DefaultCheckPointStore() CheckPointStore {
+	defaultMu.RLock()
+	s := defaultShared
+	defaultMu.RUnlock()
+	if s != nil {
+		return s
+	}
+	defaultMu.Lock()
+	defer defaultMu.Unlock()
+	if defaultShared == nil {
+		defaultShared = NewMemoryCheckPointStore()
+	}
+	return defaultShared
 }
 
 func (s *MemoryCheckPointStore) Get(_ context.Context, checkPointID string) ([]byte, bool, error) {
