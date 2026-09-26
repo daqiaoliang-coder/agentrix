@@ -216,3 +216,129 @@ func TestRunOTelApprovalOutcome(t *testing.T) {
 		t.Errorf("turn.count(outcome=approval_required) 应为 1，实际 %d", got)
 	}
 }
+
+// TestRunOTelSubagentTraceTree 验证子代理的遥测拓扑：子代理在父代理
+// 工具节点内执行（复用工具 ctx），其 turn 根 span 须以父 tools span 为
+// 直接父代而非父 turn span，整树同一 trace；子场景内模型/工具 span 挂在
+// 子 turn span 下；指标按场景维度分别计数。
+func TestRunOTelSubagentTraceTree(t *testing.T) {
+	rec, mr, cleanup := setupTestTelemetry(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	childModel := &scriptModel{replies: []*schema.Message{
+		toolCallMsg("list_draft", `{}`),
+		schema.AssistantMessage("子任务完成", nil),
+	}}
+	parentModel := &scriptModel{replies: []*schema.Message{
+		toolCallMsg("spawn_scheduler", `{"task":"排一下期"}`),
+		schema.AssistantMessage("已派生并完成", nil),
+	}}
+
+	agent, err := NewAgent(ctx, &scene.SceneConfig{
+		Key: "wbs-parent", Model: parentModel,
+		Tools:         []tool.BaseTool{&fakeReadTool{name: "list_draft"}},
+		MaxIterations: 4,
+		Subagents: map[string]*scene.SceneConfig{
+			"scheduler": {
+				Key: "scheduler", Model: childModel,
+				Tools:         []tool.BaseTool{&fakeReadTool{name: "list_draft"}},
+				MaxIterations: 4,
+			},
+		},
+	}, session.NewMemoryStore())
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	out, err := agent.Run(ctx, "sess-otel-parent", "派生排期")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if out == nil || out.Content != "已派生并完成" {
+		t.Fatalf("最终输出不符，实际 %+v", out)
+	}
+
+	spans := rec.Ended()
+	var parentTurn, childTurn, parentTools sdktrace.ReadOnlySpan
+	for _, s := range spans {
+		switch s.Name() {
+		case "agentrix.turn":
+			switch otelAttr(s, "agentrix.session").AsString() {
+			case "sess-otel-parent":
+				parentTurn = s
+			case "sess-otel-parent::scheduler":
+				childTurn = s
+			}
+		case "agentrix.tools":
+			// 父代理的 tools 节点承载 spawn_scheduler 调用
+			for _, n := range otelAttr(s, "agentrix.tool.names").AsStringSlice() {
+				if n == "spawn_scheduler" {
+					parentTools = s
+				}
+			}
+		}
+	}
+	if parentTurn == nil || childTurn == nil || parentTools == nil {
+		t.Fatalf("span 不全（父 turn / 子 turn / 父 tools 缺一不可），实际: %v", otelSpanNames(spans))
+	}
+
+	// 整树同一 trace
+	if childTurn.SpanContext().TraceID() != parentTurn.SpanContext().TraceID() {
+		t.Error("子代理 turn 应与父代理同 trace")
+	}
+	// 子 turn 的直接父代是父 tools span（spawn 工具在 ToolsNode 内同步执行），
+	// 而非父 turn span——这条拓扑是「子代理执行归属于哪次工具调用」的依据
+	if childTurn.Parent().SpanID() != parentTools.SpanContext().SpanID() {
+		t.Errorf("子 turn 父代应为父 tools span %v，实际 %v",
+			parentTools.SpanContext().SpanID(), childTurn.Parent().SpanID())
+	}
+	if got := otelAttr(childTurn, "agentrix.scene").AsString(); got != "scheduler" {
+		t.Errorf("子 turn 场景属性应为 scheduler，实际 %q", got)
+	}
+
+	// llm span 按父代分组：父 2 轮模型调用挂父 turn，子 2 轮挂子 turn
+	var underParent, underChild int
+	for _, s := range spans {
+		if s.Name() != "agentrix.llm" {
+			continue
+		}
+		switch s.Parent().SpanID() {
+		case parentTurn.SpanContext().SpanID():
+			underParent++
+		case childTurn.SpanContext().SpanID():
+			underChild++
+		}
+	}
+	if underParent != 2 || underChild != 2 {
+		t.Errorf("llm span 挂载错误：父 turn 下 %d（期望 2）、子 turn 下 %d（期望 2）", underParent, underChild)
+	}
+
+	// 父 tools span 的 tool_result 事件应回填子代理最终输出（截断后）
+	var hasChildResult bool
+	for _, ev := range parentTools.Events() {
+		if ev.Name != "tool_result" {
+			continue
+		}
+		for _, kv := range ev.Attributes {
+			if string(kv.Key) == "result" && kv.Value.AsString() == "子任务完成" {
+				hasChildResult = true
+			}
+		}
+	}
+	if !hasChildResult {
+		t.Error("父 tools span 缺少子代理输出的 tool_result 事件")
+	}
+
+	// 指标按场景维度分别计数
+	var rm metricdata.ResourceMetrics
+	if err := mr.Collect(ctx, &rm); err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	for scene, want := range map[string]int64{"wbs-parent": 1, "scheduler": 1} {
+		if got := otelMetricSum(rm, "agentrix.turn.count",
+			attribute.String("agentrix.scene", scene),
+			attribute.String("agentrix.outcome", "ok")); got != want {
+			t.Errorf("turn.count(scene=%s) 应为 %d，实际 %d", scene, want, got)
+		}
+	}
+}
