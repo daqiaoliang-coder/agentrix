@@ -62,9 +62,9 @@ func main() {
 		Tools:            reg.List(),
 		MaxIterations:    5,
 		TokenBudget:      8192,
-		TotalTimeout:     30 * time.Second, // 外层：整个 Turn 总时间预算
-		ModelCallTimeout: 10 * time.Second, // 内层：单次模型调用超时
-		NoProgressLimit:  3,                // 连续 3 轮无新进展则注入收尾提示
+		TotalTimeout:     envDuration("TOTAL_TIMEOUT", 30*time.Second),      // 外层：整个 Turn 总时间预算
+		ModelCallTimeout: envDuration("MODEL_CALL_TIMEOUT", 10*time.Second), // 内层：单次模型调用超时
+		NoProgressLimit:  3,                                                 // 连续 3 轮无新进展则注入收尾提示
 	}
 
 	store := session.NewMemoryStore()
@@ -79,4 +79,19 @@ func main() {
 	}
 
 	fmt.Println("Agent:", output.Content)
+}
+
+// envDuration 读环境变量中的秒数（如 MODEL_CALL_TIMEOUT=120），
+// 缺省或非法时取 fallback。本地小模型（如 ollama qwen3:4b）推理慢，
+// 需要比云端模型更宽的超时。
+func envDuration(key string, fallback time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	sec, err := time.ParseDuration(v + "s")
+	if err != nil || sec <= 0 {
+		return fallback
+	}
+	return sec
 }
