@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"github.com/daqiaoliang-coder/agentrix/internal/harness/hitl"
 	"github.com/daqiaoliang-coder/agentrix/internal/scene"
 	"github.com/daqiaoliang-coder/agentrix/internal/session"
+	"github.com/daqiaoliang-coder/agentrix/internal/telemetry"
 )
 
 // 持久化选择策略：
@@ -16,10 +18,15 @@ import (
 //     ai_raw_history append-only + ai_session_state CAS，以及
 //     ai_checkpoint 审批检查点）；
 //   - 否则回退到 MemoryStore（进程内，重启丢失，仅适合本地开发）。
+//
+// 可观测导出：设置了 AGENTRIX_OTEL_ENDPOINT 时经 OTLP HTTP 上报
+// trace（Turn/LLM/工具三级 span）与 metric（调用次数/Turn 时延/token
+// 用量）；未设置时 Default() 为 nil，执行路径零开销。
 func main() {
 	registry := scene.NewRegistry()
 
 	store := buildStore()
+	setupTelemetry()
 
 	// TODO: 在此注册 Scene
 	// registry.Register(&scene.SceneConfig{...})
@@ -32,6 +39,21 @@ func main() {
 
 	log.Println("agentrix listening on :8080")
 	log.Fatal(http.ListenAndServe(":8080", mux))
+}
+
+// setupTelemetry 按环境变量装配 OTel 导出。装配失败降级为禁用并记日志，
+// 可观测性故障不应阻断服务启动。
+func setupTelemetry() {
+	tel, err := telemetry.SetupFromEnv(context.Background())
+	if err != nil {
+		log.Printf("[telemetry] setup failed, observability disabled: %v", err)
+		return
+	}
+	if !tel.Enabled() {
+		return
+	}
+	telemetry.SetDefault(tel)
+	log.Println("[telemetry] OTLP export enabled (AGENTRIX_OTEL_ENDPOINT)")
 }
 
 // buildStore 根据环境变量选择 Store 实现。

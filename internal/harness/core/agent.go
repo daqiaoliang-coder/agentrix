@@ -12,6 +12,7 @@ import (
 	einotool "github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
+	"go.opentelemetry.io/otel/trace"
 
 	ctxengine "github.com/daqiaoliang-coder/agentrix/internal/context"
 	"github.com/daqiaoliang-coder/agentrix/internal/harness/budget"
@@ -19,6 +20,7 @@ import (
 	"github.com/daqiaoliang-coder/agentrix/internal/projection"
 	"github.com/daqiaoliang-coder/agentrix/internal/scene"
 	"github.com/daqiaoliang-coder/agentrix/internal/session"
+	"github.com/daqiaoliang-coder/agentrix/internal/telemetry"
 	"github.com/daqiaoliang-coder/agentrix/internal/tool/builtin"
 )
 
@@ -326,7 +328,7 @@ func (a *Agent) run(
 	userInput string,
 	resuming bool,
 	sink func(projection.Signal),
-) (*schema.Message, error) {
+) (out *schema.Message, retErr error) {
 
 	// ① 外层超时（双层超时之外层）：覆盖整个 Turn 的总时间预算
 	if a.cfg.TotalTimeout > 0 {
@@ -346,6 +348,24 @@ func (a *Agent) run(
 	// 凭它取回 sessionID/turnID，避免让模型自报归属。
 	turnID := fmt.Sprintf("turn_%d", time.Now().UnixNano())
 	ctx = projection.WithTurnScope(ctx, sessionID, turnID)
+
+	// 可观测导出：开启 Turn 根 span（图回调里的 LLM/工具 span 经 ctx 挂到其下）。
+	// 未启用时 Default() 为 nil，Enabled() 为 false，整块零开销。
+	// outcome 供 defer 读取：审批中断是暂停而非失败，需与真实错误区分。
+	tel := telemetry.Default()
+	outcome := "ok"
+	if tel.Enabled() {
+		turnStart := time.Now()
+		var turnSpan trace.Span
+		ctx, turnSpan = tel.StartTurn(ctx, a.cfg.Key, sessionID, turnID, resuming)
+		defer func() {
+			oc := outcome
+			if retErr != nil && oc == "ok" {
+				oc = "error"
+			}
+			tel.EndTurn(ctx, turnSpan, a.cfg.Key, oc, time.Since(turnStart), retErr)
+		}()
+	}
 
 	emitter := projection.NewEmitter(sessionID, turnID, sink)
 	emitter.Emit(projection.TurnStart, map[string]any{"input": userInput, "resuming": resuming})
@@ -382,12 +402,20 @@ func (a *Agent) run(
 	//
 	// toolMsgCollector 挂在图回调上捕获工具交互，供 ⑥ 追加进 RawHistory。
 	// 流式模式下追加 signalCallback，把同一批回调翻译为过程信号。
+	// 启用遥测时追加 telemetry.Callback（同步/流式都挂，与 sink 无关），
+	// 其 Close 兜底关闭审批中断路径上悬挂的节点 span——须在 EndTurn 之前
+	// 执行（defer LIFO，后注册先执行）。
 	capture := newToolMsgCollector()
 	invokeOpts := []compose.Option{compose.WithCheckPointID(sessionID)}
 	if !resuming {
 		invokeOpts = append(invokeOpts, compose.WithForceNewRun())
 	}
 	handlers := []callbacks.Handler{capture.handler()}
+	if tel.Enabled() {
+		telCb := tel.NewCallback(a.cfg.Key)
+		handlers = append(handlers, telCb.Handler())
+		defer telCb.Close()
+	}
 	if sink != nil {
 		handlers = append(handlers, newSignalCallback(emitter).handler())
 	}
@@ -401,6 +429,7 @@ func (a *Agent) run(
 		// 审批中断也是运行事实：让外层能实时感知「正在等待人工授权」
 		if approval, ok := ExtractApprovalRequired(err); ok {
 			emitter.Emit(projection.ApproveRequested, approval.Request)
+			outcome = "approval_required"
 		}
 		return nil, fmt.Errorf("invoke agent: %w", err)
 	}
