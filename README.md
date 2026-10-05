@@ -13,6 +13,7 @@ Agentrix 是一个产品级 Agent 应用框架，底层基于 Eino，
 - SessionState + RawHistory 双层记忆
 - HITL 中断恢复
 - Signal / Artifact 过程与产物投影
+- 离线 Agent 评测：真实 SceneConfig 接入、版本化任务集、多次运行统计与 JSONL 报告（[使用指南](docs/evaluation.md)）
 
 ## 快速开始
 
