@@ -44,9 +44,9 @@ type Runner struct {
 	// ConfigFactory 用于把数据集中的 SceneKey 映射到真实业务场景。
 	// 非 nil 时每个 trial 调用一次；可据此构建自己的 prompts / skills / tools。
 	ConfigFactory AgentConfigFactory
-
-	runSeq atomic.Uint64
 }
+
+var globalRunSeq atomic.Uint64
 
 // RunMetrics 是从 Agentrix 的实际运行信号中汇总出的可观察用量。
 type RunMetrics struct {
@@ -117,7 +117,7 @@ func (r *Runner) Run(ctx context.Context, tc Case) Report {
 
 func (r *Runner) run(ctx context.Context, tc Case, attempt int) Report {
 	start := time.Now()
-	seq := r.runSeq.Add(1)
+	seq := globalRunSeq.Add(1)
 	rep := Report{
 		RunID:     fmt.Sprintf("eval-%d", seq),
 		Attempt:   attempt,

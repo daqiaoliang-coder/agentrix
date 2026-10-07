@@ -61,8 +61,8 @@ func (s *MySQLCheckPointStore) Set(ctx context.Context, checkPointID string, che
 	return nil
 }
 
-// Delete 显式删除检查点。实现该接口使 eino 能清理已完结会话的残留现场，
-// 避免表只增不减。
+// Delete 显式删除检查点。compose Graph 不会自动调用它，调用方须在运行终态
+// 已持久化后清理残留现场。
 func (s *MySQLCheckPointStore) Delete(ctx context.Context, checkPointID string) error {
 	if _, err := s.db.ExecContext(ctx,
 		`DELETE FROM ai_checkpoint WHERE checkpoint_id = ?`,

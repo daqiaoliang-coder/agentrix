@@ -13,15 +13,16 @@ import (
 
 // SceneConfig 定义一个场景的完整配置
 type SceneConfig struct {
-	Key               string                     // 场景唯一标识（固定枚举）
-	Name              string                     // 场景名称
-	SystemPrompt      string                     // System Prompt
-	Model             model.ToolCallingChatModel // 模型实例
-	FallbackModel     model.ToolCallingChatModel // 降级模型（可选）：主模型重试耗尽后切到该模型再试一次
-	Tools             []tool.BaseTool            // 可用工具
-	MaxIterations     int                        // ReAct 最大循环次数
-	TokenBudget       int                        // 单次 Turn Token 预算
-	CompressThreshold float64                    // 压缩触发阈值（0-1）
+	Key                string                     // 场景唯一标识（固定枚举）
+	Name               string                     // 场景名称
+	SystemPrompt       string                     // System Prompt
+	Model              model.ToolCallingChatModel // 模型实例
+	FallbackModel      model.ToolCallingChatModel // 降级模型（可选）：主模型重试耗尽后切到该模型再试一次
+	Tools              []tool.BaseTool            // 可用工具
+	MaxIterations      int                        // ReAct 最大循环次数
+	ModelContextWindow int                        // 模型上下文窗口；零值使用压缩引擎默认值
+	TokenBudget        int                        // 单次 Turn 累计 Token 预算；零值表示不限制
+	CompressThreshold  float64                    // 压缩触发阈值（0-1）
 
 	// Skills 为该场景可见的技能装载器（渐进式加载阶段 0）。
 	// 非 nil 时，装配 Agent 会把全部技能的 name+description 注入系统提示，

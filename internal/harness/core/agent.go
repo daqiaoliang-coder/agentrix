@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -24,11 +25,14 @@ import (
 	"github.com/daqiaoliang-coder/agentrix/internal/tool/builtin"
 )
 
+var ErrCheckpointNotFound = errors.New("checkpoint not found")
+
 // Agent 是无状态的执行器，每次请求重新装配
 type Agent struct {
-	cfg      *scene.SceneConfig
-	runnable compose.Runnable[[]*schema.Message, *schema.Message]
-	store    session.Store
+	cfg             *scene.SceneConfig
+	runnable        compose.Runnable[[]*schema.Message, *schema.Message]
+	store           session.Store
+	checkpointStore hitl.CheckPointStore
 	// engine 负责上下文装配与四阶段压缩，激活此前为死代码的压缩能力
 	engine *ctxengine.Engine
 	// assembled 保存装配产物：注入技能索引后的系统提示 + 过滤/包装后的工具集
@@ -62,11 +66,19 @@ func NewAgent(
 		extra = append(extra, st)
 	}
 
-	engine, assembled, r, err := buildRuntime(ctx, cfg, extra)
+	checkpointStore := hitl.DefaultCheckPointStore()
+	engine, assembled, r, err := buildRuntime(ctx, cfg, extra, checkpointStore)
 	if err != nil {
 		return nil, err
 	}
-	return &Agent{cfg: cfg, runnable: r, store: store, engine: engine, assembled: assembled}, nil
+	return &Agent{
+		cfg:             cfg,
+		runnable:        r,
+		store:           store,
+		checkpointStore: checkpointStore,
+		engine:          engine,
+		assembled:       assembled,
+	}, nil
 }
 
 // buildRuntime 装配单个场景的运行时：压缩引擎 → 场景装配 → 框架工具追加 →
@@ -78,11 +90,12 @@ func buildRuntime(
 	ctx context.Context,
 	cfg *scene.SceneConfig,
 	extra []einotool.BaseTool,
+	checkpointStore hitl.CheckPointStore,
 ) (*ctxengine.Engine, *scene.AssembleResult, compose.Runnable[[]*schema.Message, *schema.Message], error) {
-	// 装配上下文压缩引擎：用 SceneConfig 的 TokenBudget/CompressThreshold 调参
+	// 装配上下文压缩引擎：上下文窗口与 Turn 累计 Token 预算相互独立。
 	engine := ctxengine.NewEngine()
-	if cfg.TokenBudget > 0 {
-		engine.TokenBudget = cfg.TokenBudget
+	if cfg.ModelContextWindow > 0 {
+		engine.ModelContextWindow = cfg.ModelContextWindow
 	}
 	if cfg.CompressThreshold > 0 {
 		engine.CompressThreshold = cfg.CompressThreshold
@@ -115,10 +128,9 @@ func buildRuntime(
 		}
 	}
 
-	// 固定开销快照：system prompt + 活跃工具 schema。这两块是模型每次调用都要付、
-	// 却不在 messages 列表里的真实输入；漏算会让压缩阈值失真、触发过晚。
-	// 由装配层（此处）计算并注入，engine 只消费快照，不反向依赖工具注册表。
-	engine.SetOverhead(computeOverhead(ctx, assembled.SystemPrompt, assembled.Tools))
+	// 固定开销快照只包含不在 messages 列表中的活跃工具 schema；system prompt
+	// 已由 Assemble 作为首条消息计入，不能在这里重复计算。
+	engine.SetOverhead(computeOverhead(ctx, assembled.Tools))
 
 	// 用 BudgetModel 装饰器包装原始模型：双层超时 / 重试降级 / 预算 / 无进展 / 循环内压缩
 	decorated := NewBudgetModel(cfg.Model, BudgetModelConfig{
@@ -130,7 +142,7 @@ func buildRuntime(
 		Engine:          engine,
 	})
 
-	r, err := BuildAgentGraph(ctx, decorated, assembled.Tools, cfg.MaxIterations)
+	r, err := BuildAgentGraph(ctx, decorated, assembled.Tools, cfg.MaxIterations, checkpointStore)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("build graph: %w", err)
 	}
@@ -179,12 +191,9 @@ const readResultMaxChars = 50000
 // 压缩可能在远未接近窗口时触发（白白作废缓存前缀），也可能在真要爆窗时才触发。
 func computeOverhead(
 	ctx context.Context,
-	systemPrompt string,
 	tools []einotool.BaseTool,
 ) ctxengine.PromptOverheadSnapshot {
-	snap := ctxengine.PromptOverheadSnapshot{
-		SystemTokens: ctxengine.EstimateTextTokens(systemPrompt),
-	}
+	var snap ctxengine.PromptOverheadSnapshot
 	for _, t := range tools {
 		if t == nil {
 			continue
@@ -337,6 +346,12 @@ func (a *Agent) run(
 		defer cancel()
 	}
 
+	if resuming {
+		if err := a.requireCheckpoint(ctx, sessionID); err != nil {
+			return nil, err
+		}
+	}
+
 	// ② 构造并注入 Budget（按 Turn）：token 预算 + 迭代上限 + deadline
 	b := budget.NewBudget(a.cfg.TokenBudget, a.cfg.MaxIterations)
 	if a.cfg.TotalTimeout > 0 {
@@ -407,9 +422,6 @@ func (a *Agent) run(
 	// 执行（defer LIFO，后注册先执行）。
 	capture := newToolMsgCollector()
 	invokeOpts := []compose.Option{compose.WithCheckPointID(sessionID)}
-	if !resuming {
-		invokeOpts = append(invokeOpts, compose.WithForceNewRun())
-	}
 	handlers := []callbacks.Handler{capture.handler()}
 	if tel.Enabled() {
 		telCb := tel.NewCallback(a.cfg.Key)
@@ -420,6 +432,10 @@ func (a *Agent) run(
 		handlers = append(handlers, newSignalCallback(emitter).handler())
 	}
 	invokeOpts = append(invokeOpts, compose.WithCallbacks(handlers...))
+	if !resuming {
+		// Eino v0.9.19 会用每个后续 Option 的零值覆盖 forceNewRun，故必须最后追加。
+		invokeOpts = append(invokeOpts, compose.WithForceNewRun())
+	}
 
 	// 流式模式（sink != nil）走 runnable.Stream：模型节点以流式产出，
 	// signalCallback 经 OnEndWithStreamOutput 逐帧发射 llm_token；
@@ -453,9 +469,34 @@ func (a *Agent) run(
 	if err := a.store.SaveState(ctx, sessionID, state); err != nil {
 		return nil, fmt.Errorf("save state: %w", err)
 	}
+	if err := a.deleteCheckpoint(ctx, sessionID); err != nil {
+		return nil, err
+	}
 
 	emitter.Emit(projection.TurnEnd, map[string]any{"content_length": len(output.Content)})
 	return output, nil
+}
+
+func (a *Agent) requireCheckpoint(ctx context.Context, sessionID string) error {
+	_, ok, err := a.checkpointStore.Get(ctx, sessionID)
+	if err != nil {
+		return fmt.Errorf("get checkpoint: %w", err)
+	}
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrCheckpointNotFound, sessionID)
+	}
+	return nil
+}
+
+func (a *Agent) deleteCheckpoint(ctx context.Context, sessionID string) error {
+	deleter, ok := a.checkpointStore.(hitl.CheckPointDeleter)
+	if !ok {
+		return fmt.Errorf("checkpoint store %T does not support deletion", a.checkpointStore)
+	}
+	if err := deleter.Delete(ctx, sessionID); err != nil {
+		return fmt.Errorf("delete checkpoint: %w", err)
+	}
+	return nil
 }
 
 // execute 按模式执行图：同步走 Invoke；流式走 Stream 并读空输出流、

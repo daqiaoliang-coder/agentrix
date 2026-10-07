@@ -2,6 +2,7 @@ package context
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -13,13 +14,18 @@ import (
 )
 
 const (
-	defaultTokenBudget     = 128000
-	defaultCompressRatio   = 0.8
-	defaultLowWaterRatio   = 0.65
-	defaultTailTokenBudget = 20000
-	defaultSummaryRatio    = 0.2
-	defaultMaxSummaryToken = 12000
-	trimKeepRecentTools    = 4
+	defaultModelContextWindow = 128000
+	defaultCompressRatio      = 0.8
+	defaultLowWaterRatio      = 0.65
+	defaultTailTokenBudget    = 20000
+	defaultSummaryRatio       = 0.2
+	defaultMaxSummaryToken    = 12000
+	trimKeepRecentTools       = 4
+
+	ContextWindowReasonFixedOverhead     = "fixed_overhead"
+	ContextWindowReasonCurrentInput      = "current_input_too_large"
+	ContextWindowReasonNonIdempotentTool = "non_idempotent_tool_result"
+	ContextWindowReasonProtectedContext  = "protected_context"
 
 	// oversizedResultRatio 判定「超尺寸工具结果」的阈值比例（相对 softLimit）。
 	// 单条结果的估算 token 超过 softLimit × 该比例，即视为超尺寸，允许对它做
@@ -36,28 +42,44 @@ const (
 	// 原文不超过它时采样没有意义（可能反而变大），直接跳过。
 	sampleMetaSlack = 160
 
-	// maxTailRatio 是尾部保护区占 TokenBudget 的上限比例。
+	// maxTailRatio 是尾部保护区占 ModelContextWindow 的上限比例。
 	//
 	// 为什么必须有这个约束：splitByBoundary 从末尾向前累加，直到超过 TailTokenBudget
 	// 才划出尾部边界。若 TailTokenBudget ≥ 触发压缩时的消息总量，tailStart 会一路
 	// 退到 0，middle 恒为空，compress 直接提前返回——四阶段压缩里的「结构化摘要」
 	// 阶段永远不执行，MemorySummary 永远是空串，跨轮记忆静默失效。
 	//
-	// 压缩在 effectiveTokens 越过 softLimit（TokenBudget × CompressThreshold）时触发，
-	// 此刻消息总量必然小于 TokenBudget。因此只要 TailTokenBudget < TokenBudget，
+	// 压缩在 effectiveTokens 越过 softLimit（ModelContextWindow × CompressThreshold）时触发，
+	// 此刻消息总量必然小于 ModelContextWindow。因此只要 TailTokenBudget 小于上下文窗口，
 	// 就至少存在可摘要的中间段。取 0.25 是留出余量：默认 CompressThreshold=0.8 时，
 	// 中间段至少能占到消息总量的约 3/4。
 	maxTailRatio = 0.25
 )
 
+var ErrContextWindowExceeded = errors.New("context window exceeded")
+
+type ContextWindowExceededError struct {
+	Tokens int
+	Window int
+	Reason string
+}
+
+func (e *ContextWindowExceededError) Error() string {
+	return fmt.Sprintf("%v: tokens=%d window=%d reason=%s", ErrContextWindowExceeded, e.Tokens, e.Window, e.Reason)
+}
+
+func (e *ContextWindowExceededError) Unwrap() error {
+	return ErrContextWindowExceeded
+}
+
 // Engine 负责上下文装配与压缩
 type Engine struct {
-	TokenBudget       int     // 模型上下文窗口预算
-	CompressThreshold float64 // 触发压缩的软阈值 softLimit（占 TokenBudget 比例）
-	LowWaterRatio     float64 // 低水位：一次清理到此水位以下才停（占 TokenBudget 比例）
-	TailTokenBudget   int     // 尾部保护区期望大小；实际生效值经 tailBudget() 收敛，不超过窗口的 maxTailRatio
-	MaxSummaryRatio   float64 // 摘要占被压缩内容的上限比例
-	MaxSummaryTokens  int     // 摘要 token 绝对上限
+	ModelContextWindow int     // 模型上下文窗口；零值使用默认值
+	CompressThreshold  float64 // 触发压缩的软阈值 softLimit（占上下文窗口比例）
+	LowWaterRatio      float64 // 低水位：一次清理到此水位以下才停（占上下文窗口比例）
+	TailTokenBudget    int     // 尾部保护区期望大小；实际生效值经 tailBudget() 收敛，不超过窗口的 maxTailRatio
+	MaxSummaryRatio    float64 // 摘要占被压缩内容的上限比例
+	MaxSummaryTokens   int     // 摘要 token 绝对上限
 
 	// IsNonIdempotent 判定某工具是否为写/非幂等操作（如 edit/create/delete）。
 	// 返回 true 的工具结果不参与淘汰：这类结果无法重放（重跑会重复执行副作用），
@@ -92,12 +114,12 @@ type Engine struct {
 
 func NewEngine() *Engine {
 	return &Engine{
-		TokenBudget:       defaultTokenBudget,
-		CompressThreshold: defaultCompressRatio,
-		LowWaterRatio:     defaultLowWaterRatio,
-		TailTokenBudget:   defaultTailTokenBudget,
-		MaxSummaryRatio:   defaultSummaryRatio,
-		MaxSummaryTokens:  defaultMaxSummaryToken,
+		ModelContextWindow: defaultModelContextWindow,
+		CompressThreshold:  defaultCompressRatio,
+		LowWaterRatio:      defaultLowWaterRatio,
+		TailTokenBudget:    defaultTailTokenBudget,
+		MaxSummaryRatio:    defaultSummaryRatio,
+		MaxSummaryTokens:   defaultMaxSummaryToken,
 	}
 }
 
@@ -108,8 +130,8 @@ func NewEngineWithModel(m model.BaseChatModel) *Engine {
 	return e
 }
 
-// SetOverhead 注入固定开销快照（system prompt / 工具 schema / 多模态预留）。
-// 由装配层在确定 active toolset 后调用一次；toolset 变更时应重新计算并注入。
+// SetOverhead 注入固定开销快照（工具 schema / 多模态预留）。
+// System Prompt 已在 messages 中计数。由装配层在确定 active toolset 后调用一次。
 func (e *Engine) SetOverhead(s PromptOverheadSnapshot) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -137,6 +159,53 @@ func (e *Engine) effectiveTokens(messages []*schema.Message) int {
 	return EstimateMessagesTokens(messages) + e.Overhead().Total()
 }
 
+func (e *Engine) contextWindow() int {
+	if e.ModelContextWindow > 0 {
+		return e.ModelContextWindow
+	}
+	return defaultModelContextWindow
+}
+
+func (e *Engine) ensureWithinContextWindow(messages []*schema.Message) error {
+	return e.ensureWithinContextWindowAt(messages, e.effectiveTokens(messages))
+}
+
+func (e *Engine) ensureWithinContextWindowAt(messages []*schema.Message, tokens int) error {
+	window := e.contextWindow()
+	if tokens <= window {
+		return nil
+	}
+	return &ContextWindowExceededError{
+		Tokens: tokens,
+		Window: window,
+		Reason: e.contextWindowExceededReason(messages, window),
+	}
+}
+
+func (e *Engine) contextWindowExceededReason(messages []*schema.Message, window int) string {
+	if e.Overhead().Total() >= window {
+		return ContextWindowReasonFixedOverhead
+	}
+	for i := len(messages) - 1; i >= 0; i-- {
+		message := messages[i]
+		if message == nil || message.Role != schema.User {
+			continue
+		}
+		if EstimateMessageTokens(message)+e.Overhead().Total() > window {
+			return ContextWindowReasonCurrentInput
+		}
+		break
+	}
+	if e.IsNonIdempotent != nil {
+		for _, message := range messages {
+			if message != nil && message.Role == schema.Tool && e.IsNonIdempotent(message.ToolName) {
+				return ContextWindowReasonNonIdempotentTool
+			}
+		}
+	}
+	return ContextWindowReasonProtectedContext
+}
+
 // softLimit 返回触发压缩的 token 线。
 func (e *Engine) softLimit() int {
 	return e.thresholdAt(e.CompressThreshold, defaultCompressRatio)
@@ -157,29 +226,21 @@ func (e *Engine) lowWater() int {
 
 // thresholdAt 把比例换算为 token 绝对值，对非法配置回落到默认值。
 func (e *Engine) thresholdAt(ratio, fallback float64) int {
-	budget := e.TokenBudget
-	if budget <= 0 {
-		budget = defaultTokenBudget
-	}
 	if ratio <= 0 || ratio > 1 {
 		ratio = fallback
 	}
-	return int(float64(budget) * ratio)
+	return int(float64(e.contextWindow()) * ratio)
 }
 
 // tailBudget 返回实际生效的尾部保护区大小：期望值与「窗口 × maxTailRatio」取较小者。
 //
 // 这一步收敛是「结构化摘要阶段能否执行」的开关。TailTokenBudget 的默认值 20000
-// 是按 128k 窗口设定的，但接入方常把 TokenBudget 配成 16k 甚至 8k；此时 20000
+// 是按 128k 窗口设定的，但接入方常把 ModelContextWindow 配成 16k 甚至 8k；此时 20000
 // 大于整个窗口，middle 恒为空，LLM 摘要路径被静默跳过（详见 maxTailRatio 注释）。
 // 在引擎内部收敛而不是要求每个接入方记得联动配置，是因为漏配不报错、只表现为
 // 「压缩好像没效果」，排查成本远高于这里的一次 min。
 func (e *Engine) tailBudget() int {
-	budget := e.TokenBudget
-	if budget <= 0 {
-		budget = defaultTokenBudget
-	}
-	windowCap := int(float64(budget) * maxTailRatio)
+	windowCap := int(float64(e.contextWindow()) * maxTailRatio)
 	if windowCap <= 0 {
 		windowCap = 1
 	}
@@ -209,9 +270,9 @@ func (e *Engine) tailBudget() int {
 // 每次模型调用都发一条「未压缩」信号会淹掉真正需要看的事件。
 // 反之，越过阈值却没改写序列（Triggered=false）会被如实上报——那正是
 // §1「middle 恒空」和 §3「keepRecent 免死金牌」两类静默失效的特征。
-func (e *Engine) CompressInPlace(ctx context.Context, messages []*schema.Message) []*schema.Message {
-	out, _ := e.CompressInPlaceWithStats(ctx, messages)
-	return out
+func (e *Engine) CompressInPlace(ctx context.Context, messages []*schema.Message) ([]*schema.Message, error) {
+	out, _, err := e.CompressInPlaceWithStats(ctx, messages)
+	return out, err
 }
 
 // CompressInPlaceWithStats 是 CompressInPlace 的统计版本，额外返回本次压缩的账本。
@@ -220,22 +281,25 @@ func (e *Engine) CompressInPlace(ctx context.Context, messages []*schema.Message
 // 钩子只能指向一个目标；而 Budget 是按 Turn 创建的。若靠钩子把账本塞进 Budget，
 // 并发 Turn 之间会串号。返回值让调用方自己决定记到哪个 Budget 上，天然无竞态。
 //
-// 未越过 softLimit 时返回原序列且 stats.Triggered=false——这类轮次占绝大多数，
+// 未达到 softLimit 时返回原序列且 stats.Triggered=false——这类轮次占绝大多数，
 // 调用方据此可选择不记账，避免 CompressEvents 退化成「模型调用次数」。
 func (e *Engine) CompressInPlaceWithStats(
 	ctx context.Context,
 	messages []*schema.Message,
-) (out []*schema.Message, stats CompressStats) {
+) (out []*schema.Message, stats CompressStats, err error) {
 
 	before := e.effectiveTokens(messages)
-	if before <= e.softLimit() {
-		return messages, CompressStats{Path: "inplace", TokensBefore: before, TokensAfter: before}
+	if before < e.softLimit() {
+		return messages, CompressStats{Path: "inplace", TokensBefore: before, TokensAfter: before}, nil
 	}
 
 	stats = CompressStats{Path: "inplace", TokensBefore: before}
 	defer func() {
 		stats.TokensAfter = e.effectiveTokens(out)
 		stats.Triggered = stats.Sampled > 0 || stats.Evicted > 0 || stats.Placeholders > 0
+		if err == nil {
+			err = e.ensureWithinContextWindowAt(out, stats.TokensAfter)
+		}
 		e.notifyCompacted(stats)
 	}()
 
@@ -252,7 +316,7 @@ func (e *Engine) CompressInPlaceWithStats(
 		stats.Placeholders = ph
 		stats.UnrecoverableLost = (stats.Sampled - nSampledOffloaded) + ph
 		stats.StablePrefixTokens = stablePrefixTokens(messages, res)
-		return res, stats
+		return res, stats, nil
 	}
 
 	evicted, nEvicted, nEvictedOffloaded := e.evictToolResultsCounted(ctx, sampled, trimKeepRecentTools, e.lowWater())
@@ -266,7 +330,7 @@ func (e *Engine) CompressInPlaceWithStats(
 	// 无法用 token 衡量的量，直接对应下游任务失败与幻觉风险。
 	stats.UnrecoverableLost = (stats.Sampled - nSampledOffloaded) + (stats.Evicted - nEvictedOffloaded) + ph
 	stats.StablePrefixTokens = stablePrefixTokens(messages, res)
-	return res, stats
+	return res, stats, nil
 }
 
 // Assemble 装配模型可见上下文，必要时触发压缩
@@ -359,6 +423,9 @@ func (e *Engine) compress(
 		fixed, ph := e.fixToolCallPairsCounted(ctx, trimmed)
 		stats.Placeholders = ph
 		stats.UnrecoverableLost = (nSampled - nSampledOffloaded) + (nEvicted - nEvictedOffloaded) + ph
+		if limitErr := e.ensureWithinContextWindow(fixed); limitErr != nil {
+			return nil, stats, limitErr
+		}
 		return fixed, stats, nil
 	}
 
@@ -379,10 +446,6 @@ func (e *Engine) compress(
 	stats.SummaryModelTokens = modelTokens
 	stats.SummaryViaLLM = viaLLM
 
-	if state != nil {
-		state.Memory.Summary = summary
-	}
-
 	// 阶段④：工具调用对修复
 	merged := make([]*schema.Message, 0, len(head)+1+len(tail))
 	merged = append(merged, head...)
@@ -392,6 +455,12 @@ func (e *Engine) compress(
 	fixed, ph := e.fixToolCallPairsCounted(ctx, merged)
 	stats.Placeholders = ph
 	stats.UnrecoverableLost = (nSampled - nSampledOffloaded) + (nEvicted - nEvictedOffloaded) + ph
+	if limitErr := e.ensureWithinContextWindow(fixed); limitErr != nil {
+		return nil, stats, limitErr
+	}
+	if state != nil {
+		state.Memory.Summary = summary
+	}
 
 	return fixed, stats, nil
 }
@@ -726,7 +795,7 @@ func (e *Engine) spillStore() SpillStore {
 
 // maxTailShareOfMessages 是尾部保护区占「实际消息总量」的上限比例。
 //
-// 只按 TokenBudget 收敛尾部还不够。压缩是在 effectiveTokens（消息 + 固定开销）
+// 只按 ModelContextWindow 收敛尾部还不够。压缩是在 effectiveTokens（消息 + 固定开销）
 // 越过 softLimit 时触发的，当 overhead 很大（庞大的系统提示 + 几十个工具 schema）
 // 时，触发那一刻的消息本体可能只占窗口的一小部分。若尾部保护区仍按窗口比例算，
 // 就会大于消息总量，middle 再次退化为空。

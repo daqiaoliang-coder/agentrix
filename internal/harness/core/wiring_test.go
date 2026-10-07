@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -9,6 +10,7 @@ import (
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
 
+	ctxengine "github.com/daqiaoliang-coder/agentrix/internal/context"
 	"github.com/daqiaoliang-coder/agentrix/internal/harness/hitl"
 	"github.com/daqiaoliang-coder/agentrix/internal/scene"
 	"github.com/daqiaoliang-coder/agentrix/internal/session"
@@ -160,6 +162,15 @@ func containsStr(hay []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+func useCheckpointStore(t *testing.T) *hitl.MemoryCheckPointStore {
+	t.Helper()
+	previous := hitl.DefaultCheckPointStore()
+	store := hitl.NewMemoryCheckPointStore()
+	hitl.SetDefaultCheckPointStore(store)
+	t.Cleanup(func() { hitl.SetDefaultCheckPointStore(previous) })
+	return store
 }
 
 func wbsCatalog(t *testing.T) *agenttool.Catalog {
@@ -362,6 +373,7 @@ func TestCatalogWhitelistFiltersTools(t *testing.T) {
 
 func TestApprovalInterruptBlocksWriteUntilAuthorized(t *testing.T) {
 	ctx := context.Background()
+	checkpointStore := useCheckpointStore(t)
 	catalog := wbsCatalog(t)
 	writeTool := &fakeWriteTool{name: "edit_draft"}
 	store := session.NewMemoryStore()
@@ -396,6 +408,9 @@ func TestApprovalInterruptBlocksWriteUntilAuthorized(t *testing.T) {
 	if writeTool.ran != 0 {
 		t.Errorf("未授权情况下写工具被执行了 %d 次", writeTool.ran)
 	}
+	if _, exists, err := checkpointStore.Get(ctx, "sess-approval"); err != nil || !exists {
+		t.Fatalf("审批中断后应保留 checkpoint: exists=%v err=%v", exists, err)
+	}
 
 	// ② 授权通过：恢复后写工具执行一次。
 	//    恢复从工具节点继续，随后模型被调用，故脚本只给收尾回复。
@@ -415,10 +430,23 @@ func TestApprovalInterruptBlocksWriteUntilAuthorized(t *testing.T) {
 	if out == nil || strings.TrimSpace(out.Content) == "" {
 		t.Error("恢复后未返回模型输出")
 	}
+	if _, exists, err := checkpointStore.Get(ctx, "sess-approval"); err != nil || exists {
+		t.Fatalf("恢复完成后 checkpoint 应删除: exists=%v err=%v", exists, err)
+	}
+
+	_, err = agent2.Resume(ctx, "sess-approval", approval.InterruptID,
+		&hitl.ApprovalDecision{Approved: true, Operator: "planner"})
+	if !errors.Is(err, ErrCheckpointNotFound) {
+		t.Fatalf("重复 Resume 应返回 ErrCheckpointNotFound，实际: %v", err)
+	}
+	if writeTool.ran != 1 {
+		t.Errorf("重复 Resume 不得再次执行写工具，实际执行 %d 次", writeTool.ran)
+	}
 }
 
 func TestApprovalRejectDoesNotExecuteWrite(t *testing.T) {
 	ctx := context.Background()
+	checkpointStore := useCheckpointStore(t)
 	catalog := wbsCatalog(t)
 	writeTool := &fakeWriteTool{name: "edit_draft"}
 	store := session.NewMemoryStore()
@@ -454,6 +482,101 @@ func TestApprovalRejectDoesNotExecuteWrite(t *testing.T) {
 	if writeTool.ran != 0 {
 		t.Errorf("拒绝授权后写工具仍被执行 %d 次", writeTool.ran)
 	}
+	if _, exists, err := checkpointStore.Get(ctx, "sess-reject"); err != nil || exists {
+		t.Fatalf("拒绝完成后 checkpoint 应删除: exists=%v err=%v", exists, err)
+	}
+}
+
+func TestSecondApprovalInterruptKeepsCheckpoint(t *testing.T) {
+	ctx := context.Background()
+	checkpointStore := useCheckpointStore(t)
+	catalog := wbsCatalog(t)
+	mustRegisterSpec(t, catalog, agenttool.CommandSpec{
+		ToolName: "publish_draft", Resource: "wbs-arrangement", Command: "publish-draft",
+		Exec: agenttool.ExecInProcess, NeedsApproval: true, ApprovalReason: "发布排期需人工授权",
+	})
+	editTool := &fakeWriteTool{name: "edit_draft"}
+	publishTool := &fakeWriteTool{name: "publish_draft"}
+	store := session.NewMemoryStore()
+	newCfg := func(m model.ToolCallingChatModel) *scene.SceneConfig {
+		return &scene.SceneConfig{
+			Key: "wbs", Model: m, Tools: []tool.BaseTool{editTool, publishTool},
+			Catalog: catalog, MaxIterations: 4,
+		}
+	}
+
+	agent1, err := NewAgent(ctx, newCfg(&scriptModel{replies: []*schema.Message{
+		toolCallMsg("edit_draft", `{"payload":"edit"}`),
+	}}), store)
+	if err != nil {
+		t.Fatalf("NewAgent(first): %v", err)
+	}
+	_, err = agent1.Run(ctx, "sess-second-approval", "编辑并发布")
+	firstApproval, ok := ExtractApprovalRequired(err)
+	if !ok {
+		t.Fatalf("第一次审批中断未识别: %v", err)
+	}
+
+	agent2, err := NewAgent(ctx, newCfg(&scriptModel{replies: []*schema.Message{
+		toolCallMsg("publish_draft", `{"payload":"publish"}`),
+	}}), store)
+	if err != nil {
+		t.Fatalf("NewAgent(second): %v", err)
+	}
+	_, err = agent2.Resume(ctx, "sess-second-approval", firstApproval.InterruptID,
+		&hitl.ApprovalDecision{Approved: true, Operator: "planner"})
+	secondApproval, ok := ExtractApprovalRequired(err)
+	if !ok {
+		t.Fatalf("第二次审批中断未识别: %v", err)
+	}
+	if editTool.ran != 1 || publishTool.ran != 0 {
+		t.Fatalf("第二次中断时工具执行次数不正确: edit=%d publish=%d", editTool.ran, publishTool.ran)
+	}
+	if _, exists, err := checkpointStore.Get(ctx, "sess-second-approval"); err != nil || !exists {
+		t.Fatalf("第二次审批中断后应保留最新 checkpoint: exists=%v err=%v", exists, err)
+	}
+
+	agent3, err := NewAgent(ctx, newCfg(&scriptModel{replies: []*schema.Message{
+		schema.AssistantMessage("已编辑，发布已取消", nil),
+	}}), store)
+	if err != nil {
+		t.Fatalf("NewAgent(final): %v", err)
+	}
+	if _, err := agent3.Resume(ctx, "sess-second-approval", secondApproval.InterruptID,
+		&hitl.ApprovalDecision{Approved: false, Operator: "planner"}); err != nil {
+		t.Fatalf("第二次审批拒绝后应正常完成: %v", err)
+	}
+	if _, exists, err := checkpointStore.Get(ctx, "sess-second-approval"); err != nil || exists {
+		t.Fatalf("二次审批终态后 checkpoint 应删除: exists=%v err=%v", exists, err)
+	}
+}
+
+func TestRunIgnoresAndDeletesStaleCheckpoint(t *testing.T) {
+	ctx := context.Background()
+	checkpointStore := useCheckpointStore(t)
+	const sessionID = "sess-stale"
+	if err := checkpointStore.Set(ctx, sessionID, []byte("invalid stale checkpoint")); err != nil {
+		t.Fatalf("Set checkpoint: %v", err)
+	}
+
+	agent, err := NewAgent(ctx, &scene.SceneConfig{
+		Key:           "plain",
+		Model:         &scriptModel{replies: []*schema.Message{schema.AssistantMessage("fresh", nil)}},
+		MaxIterations: 2,
+	}, session.NewMemoryStore())
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	out, err := agent.Run(ctx, sessionID, "new turn")
+	if err != nil {
+		t.Fatalf("Run 应忽略陈旧 checkpoint: %v", err)
+	}
+	if out.Content != "fresh" {
+		t.Fatalf("Run 输出 = %q，期望 fresh", out.Content)
+	}
+	if _, exists, err := checkpointStore.Get(ctx, sessionID); err != nil || exists {
+		t.Fatalf("新运行完成后 checkpoint 应删除: exists=%v err=%v", exists, err)
+	}
 }
 
 // ---------- 拼图 4：压缩接线（开销快照 + 回读工具 + 非幂等标记）----------
@@ -469,16 +592,23 @@ func TestNewAgentWiresCompressionPlumbing(t *testing.T) {
 	writeTool := &fakeWriteTool{name: "edit_draft"}
 
 	agent, err := NewAgent(ctx, &scene.SceneConfig{
-		Key:           "wbs",
-		SystemPrompt:  "你是排期助手",
-		Model:         &scriptModel{},
-		Tools:         []tool.BaseTool{readTool, writeTool},
-		Catalog:       catalog,
-		MaxIterations: 3,
-		TokenBudget:   8192,
+		Key:                "wbs",
+		SystemPrompt:       "你是排期助手",
+		Model:              &scriptModel{},
+		Tools:              []tool.BaseTool{readTool, writeTool},
+		Catalog:            catalog,
+		MaxIterations:      3,
+		ModelContextWindow: 8192,
+		TokenBudget:        2048,
 	}, session.NewMemoryStore())
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
+	}
+	if got := agent.engine.ModelContextWindow; got != 8192 {
+		t.Fatalf("模型上下文窗口 = %d，期望 8192", got)
+	}
+	if got := agent.cfg.TokenBudget; got != 2048 {
+		t.Fatalf("Turn Token 预算 = %d，期望 2048", got)
 	}
 
 	// ① read_result 必须对模型可见，否则被淘汰的结果无法回读
@@ -493,17 +623,31 @@ func TestNewAgentWiresCompressionPlumbing(t *testing.T) {
 		}
 	}
 
-	// ② 开销快照必须非零：系统提示与工具 schema 都是真实输入开销
+	// ② 固定开销只计入不在 messages 中的工具 schema；system prompt 由消息估算负责。
 	overhead := agent.engine.Overhead()
-	if overhead.SystemTokens <= 0 {
-		t.Errorf("系统提示开销未计入快照: %+v", overhead)
-	}
 	if overhead.ToolsTokens <= 0 {
 		t.Errorf("工具 schema 开销未计入快照: %+v", overhead)
 	}
-	// 快照应覆盖技能索引之外的系统提示正文
+	// 装配后的 system prompt 会作为首条消息参与估算。
 	if !strings.Contains(agent.assembled.SystemPrompt, "你是排期助手") {
 		t.Error("装配后的系统提示丢失了原始正文")
+	}
+
+	probe := []*schema.Message{schema.UserMessage(strings.Repeat("x", 8000))}
+	effective := ctxengine.EstimateMessagesTokens(probe) + overhead.Total()
+	if effective <= agent.cfg.TokenBudget {
+		t.Fatalf("测试前提不成立：effective tokens %d 未超过 Turn 预算 %d", effective, agent.cfg.TokenBudget)
+	}
+	windowSoftLimit := agent.engine.ModelContextWindow * 8 / 10
+	if effective >= windowSoftLimit {
+		t.Fatalf("测试前提不成立：effective tokens %d 已达到窗口软阈值 %d", effective, windowSoftLimit)
+	}
+	_, stats, err := agent.engine.CompressInPlaceWithStats(ctx, probe)
+	if err != nil {
+		t.Fatalf("仅超过 Turn 预算不应被上下文窗口拒绝: %v", err)
+	}
+	if stats.Triggered {
+		t.Fatal("Turn Token 预算被错误复用为上下文压缩阈值")
 	}
 
 	// ③ 写工具判定为非幂等，读工具不是
@@ -520,6 +664,27 @@ func TestNewAgentWiresCompressionPlumbing(t *testing.T) {
 	// 溢出存储已接入，offload 才可能可恢复
 	if agent.engine.Overhead().Total() <= 0 {
 		t.Error("开销快照总量为零，压缩阈值会失真")
+	}
+}
+
+func TestBudgetModelRejectsOversizedInputBeforeModelCall(t *testing.T) {
+	engine := ctxengine.NewEngine()
+	engine.ModelContextWindow = 100
+	raw := &scriptModel{replies: []*schema.Message{schema.AssistantMessage("不应调用", nil)}}
+	decorated := NewBudgetModel(raw, BudgetModelConfig{Engine: engine})
+	input := []*schema.Message{schema.UserMessage(strings.Repeat("oversized", 100))}
+
+	if _, err := decorated.Generate(context.Background(), input); !errors.Is(err, ctxengine.ErrContextWindowExceeded) {
+		t.Fatalf("Generate 错误 = %v，期望 ErrContextWindowExceeded", err)
+	}
+	if raw.call != 0 {
+		t.Fatalf("Generate 超窗后仍调用底层模型 %d 次", raw.call)
+	}
+	if _, err := decorated.Stream(context.Background(), input); !errors.Is(err, ctxengine.ErrContextWindowExceeded) {
+		t.Fatalf("Stream 错误 = %v，期望 ErrContextWindowExceeded", err)
+	}
+	if raw.call != 0 {
+		t.Fatalf("Stream 超窗后仍调用底层模型 %d 次", raw.call)
 	}
 }
 

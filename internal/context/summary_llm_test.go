@@ -88,7 +88,7 @@ func wellFormedSummary() string {
 func TestSummarizeViaLLMProducesStructuredFields(t *testing.T) {
 	fake := newFakeSummaryModel(schema.AssistantMessage(wellFormedSummary(), nil))
 	e := NewEngineWithModel(fake)
-	e.TokenBudget = 16384
+	e.ModelContextWindow = 16384
 	e.SetSpillStore(NewMemorySpillStore())
 
 	state := &session.State{}
@@ -141,7 +141,7 @@ func TestSummaryIncrementalUpdateFeedsPrevSummary(t *testing.T) {
 		schema.AssistantMessage(second, nil),
 	)
 	e := NewEngineWithModel(fake)
-	e.TokenBudget = 16384
+	e.ModelContextWindow = 16384
 	e.SetSpillStore(NewMemorySpillStore())
 
 	state := &session.State{}
@@ -181,7 +181,7 @@ func TestSummaryModelTokensRecordedAsCost(t *testing.T) {
 			PromptTokens: 5000, CompletionTokens: 300, TotalTokens: 5300,
 		}
 		e := NewEngineWithModel(fake)
-		e.TokenBudget = 16384
+		e.ModelContextWindow = 16384
 		e.SetSpillStore(NewMemorySpillStore())
 
 		_, stats, err := e.AssembleWithStats(context.Background(), "sys", &session.State{},
@@ -198,7 +198,7 @@ func TestSummaryModelTokensRecordedAsCost(t *testing.T) {
 		fake := newFakeSummaryModel(schema.AssistantMessage(wellFormedSummary(), nil))
 		// 不设 usage：模拟 provider 不回传用量明细
 		e := NewEngineWithModel(fake)
-		e.TokenBudget = 16384
+		e.ModelContextWindow = 16384
 		e.SetSpillStore(NewMemorySpillStore())
 
 		_, stats, err := e.AssembleWithStats(context.Background(), "sys", &session.State{},
@@ -216,7 +216,7 @@ func TestSummaryModelTokensRecordedAsCost(t *testing.T) {
 		fake := newFakeSummaryModel(schema.AssistantMessage(wellFormedSummary(), nil))
 		fake.st.usage = &schema.TokenUsage{PromptTokens: 5000, CompletionTokens: 300, TotalTokens: 5300}
 		e := NewEngineWithModel(fake)
-		e.TokenBudget = 16384
+		e.ModelContextWindow = 16384
 		e.SetSpillStore(NewMemorySpillStore())
 
 		_, stats, err := e.AssembleWithStats(context.Background(), "sys", &session.State{},
@@ -241,7 +241,7 @@ func TestSummarizeFailureDoesNotRecordStats(t *testing.T) {
 	fake := newFakeSummaryModel()
 	fake.st.err = fmt.Errorf("summary model unavailable")
 	e := NewEngineWithModel(fake)
-	e.TokenBudget = 16384
+	e.ModelContextWindow = 16384
 	e.SetSpillStore(NewMemorySpillStore())
 
 	var notified int
@@ -381,7 +381,7 @@ func TestRepeatedCompressionDoesNotDegradeMonotonically(t *testing.T) {
 	fake.st.replies = replies
 
 	e := NewEngineWithModel(fake)
-	e.TokenBudget = 16384
+	e.ModelContextWindow = 16384
 	e.SetSpillStore(NewMemorySpillStore())
 
 	state := &session.State{}
@@ -434,14 +434,14 @@ func TestRepeatedCompressionDoesNotDegradeMonotonically(t *testing.T) {
 // TestCompressStatsAccounting 验证账本的算术自洽与语义正确。
 func TestCompressStatsAccounting(t *testing.T) {
 	e := NewEngine()
-	e.TokenBudget = 10000
+	e.ModelContextWindow = 10000
 	spill := NewMemorySpillStore()
 	e.SetSpillStore(spill)
 
 	msgs := buildToolHistory(20, 1600)
 	before := e.effectiveTokens(msgs)
 
-	out, stats := e.CompressInPlaceWithStats(context.Background(), msgs)
+	out, stats := mustCompressInPlaceWithStats(t, e, msgs)
 
 	if !stats.Triggered {
 		t.Fatal("越过 softLimit 却未触发压缩")
@@ -487,11 +487,11 @@ func TestCompressStatsAccounting(t *testing.T) {
 // 漏计会让人以为「零成本压缩」，而实际模型已经少看到了数据。
 func TestUnrecoverableLostCountedWithoutSpill(t *testing.T) {
 	e := NewEngine()
-	e.TokenBudget = 10000
+	e.ModelContextWindow = 10000
 	// 故意不配 SpillStore
 
 	msgs := buildToolHistory(20, 1600)
-	_, stats := e.CompressInPlaceWithStats(context.Background(), msgs)
+	_, stats := mustCompressInPlaceWithStats(t, e, msgs)
 
 	if !stats.Triggered {
 		t.Fatal("未触发压缩，无法验证计数")
@@ -512,14 +512,14 @@ func TestUnrecoverableLostCountedWithoutSpill(t *testing.T) {
 // 这类轮次占绝大多数，全发出去会淹掉真正需要关注的压缩事件。
 func TestNoCompactionSignalWhenUnderThreshold(t *testing.T) {
 	e := NewEngine()
-	e.TokenBudget = 100000 // softLimit 远超测试消息体量
+	e.ModelContextWindow = 100000 // softLimit 远超测试消息体量
 	e.SetSpillStore(NewMemorySpillStore())
 
 	var got []CompressStats
 	e.OnCompacted = func(s CompressStats) { got = append(got, s) }
 
 	msgs := buildToolHistory(10, 200)
-	out := e.CompressInPlace(context.Background(), msgs)
+	out := mustCompressInPlace(t, e, msgs)
 
 	if len(got) != 0 {
 		t.Errorf("未越阈值却发出 %d 次压缩事件", len(got))
@@ -533,14 +533,14 @@ func TestNoCompactionSignalWhenUnderThreshold(t *testing.T) {
 // 且账本内容完整可序列化（外层要把它桥接成 projection.ContextCompacted 信号）。
 func TestCompactionHookFiresWhenTriggered(t *testing.T) {
 	e := NewEngine()
-	e.TokenBudget = 10000
+	e.ModelContextWindow = 10000
 	e.SetSpillStore(NewMemorySpillStore())
 
 	var got []CompressStats
 	e.OnCompacted = func(s CompressStats) { got = append(got, s) }
 
 	msgs := buildToolHistory(20, 1600)
-	e.CompressInPlace(context.Background(), msgs)
+	mustCompressInPlace(t, e, msgs)
 
 	if len(got) != 1 {
 		t.Fatalf("应发出 1 次压缩事件，实际 %d 次", len(got))

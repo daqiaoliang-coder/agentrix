@@ -12,6 +12,7 @@ import (
 	"github.com/cloudwego/eino/schema"
 
 	ctxengine "github.com/daqiaoliang-coder/agentrix/internal/context"
+	"github.com/daqiaoliang-coder/agentrix/internal/harness/hitl"
 	"github.com/daqiaoliang-coder/agentrix/internal/projection"
 	"github.com/daqiaoliang-coder/agentrix/internal/scene"
 	"github.com/daqiaoliang-coder/agentrix/internal/session"
@@ -30,14 +31,15 @@ import (
 //     父视角只有一对 tool_start/tool_end，子代理内部展开对父不可见。
 //   - 防递归：构造时丢弃子场景的 Subagents 字段，子代理不能再派生孙代理。
 type subagentTool struct {
-	name      string
-	key       string
-	desc      string
-	cfg       *scene.SceneConfig
-	engine    *ctxengine.Engine
-	assembled *scene.AssembleResult
-	runnable  compose.Runnable[[]*schema.Message, *schema.Message]
-	store     session.Store
+	name            string
+	key             string
+	desc            string
+	cfg             *scene.SceneConfig
+	engine          *ctxengine.Engine
+	assembled       *scene.AssembleResult
+	runnable        compose.Runnable[[]*schema.Message, *schema.Message]
+	store           session.Store
+	checkpointStore hitl.CheckPointStore
 }
 
 func newSubagentTool(
@@ -53,7 +55,8 @@ func newSubagentTool(
 	child := *childCfg
 	child.Subagents = nil
 
-	engine, assembled, r, err := buildRuntime(ctx, &child, nil)
+	checkpointStore := hitl.DefaultCheckPointStore()
+	engine, assembled, r, err := buildRuntime(ctx, &child, nil, checkpointStore)
 	if err != nil {
 		return nil, err
 	}
@@ -63,14 +66,15 @@ func newSubagentTool(
 		desc = key
 	}
 	return &subagentTool{
-		name:      "spawn_" + key,
-		key:       key,
-		desc:      desc,
-		cfg:       &child,
-		engine:    engine,
-		assembled: assembled,
-		runnable:  r,
-		store:     store,
+		name:            "spawn_" + key,
+		key:             key,
+		desc:            desc,
+		cfg:             &child,
+		engine:          engine,
+		assembled:       assembled,
+		runnable:        r,
+		store:           store,
+		checkpointStore: checkpointStore,
 	}, nil
 }
 
@@ -130,11 +134,12 @@ func (t *subagentTool) InvokableRun(
 	}
 
 	child := &Agent{
-		cfg:       t.cfg,
-		runnable:  t.runnable,
-		store:     t.store,
-		engine:    t.engine,
-		assembled: t.assembled,
+		cfg:             t.cfg,
+		runnable:        t.runnable,
+		store:           t.store,
+		checkpointStore: t.checkpointStore,
+		engine:          t.engine,
+		assembled:       t.assembled,
 	}
 	out, err := child.run(ctx, childSession, args.Task, false, nil)
 	if err != nil {

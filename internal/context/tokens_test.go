@@ -3,6 +3,8 @@ package context
 import (
 	"strings"
 	"testing"
+
+	"github.com/cloudwego/eino/schema"
 )
 
 // 本文件验证 token 估算器本身的可信度。
@@ -202,7 +204,7 @@ func TestEstimateSingleSourceOfTruth(t *testing.T) {
 // （need-driven 的固有代价）。这个数必须远小于 LLM 调用延迟，否则得不偿失。
 func BenchmarkEffectiveTokens(b *testing.B) {
 	e := NewEngine()
-	e.TokenBudget = 128000
+	e.ModelContextWindow = 128000
 	msgs := buildToolHistory(50, 2000)
 
 	b.ReportAllocs()
@@ -222,7 +224,7 @@ func BenchmarkEffectiveTokens(b *testing.B) {
 // harness/core.computeOverhead 已改用 EstimateTextTokens，这里锁住这个约定。
 func TestEstimateOverheadUsesSameScale(t *testing.T) {
 	e := NewEngine()
-	e.TokenBudget = 10000
+	e.ModelContextWindow = 10000
 
 	msgs := buildToolHistory(10, 200)
 	base := e.effectiveTokens(msgs)
@@ -232,16 +234,30 @@ func TestEstimateOverheadUsesSameScale(t *testing.T) {
 	}
 
 	// overhead 必须是可加的绝对 token 量，不做二次换算
-	e.SetOverhead(PromptOverheadSnapshot{SystemTokens: 5000, ToolsTokens: 4000, Multimodal: 1000})
-	if got, want := e.effectiveTokens(msgs), base+10000; got != want {
-		t.Errorf("计入 overhead 后 %d，应为 %d（消息 %d + 开销 10000）", got, want, base)
+	e.SetOverhead(PromptOverheadSnapshot{ToolsTokens: 4000, Multimodal: 1000})
+	if got, want := e.effectiveTokens(msgs), base+5000; got != want {
+		t.Errorf("计入 overhead 后 %d，应为 %d（消息 %d + 开销 5000）", got, want, base)
 	}
-	if e.Overhead().Total() != 10000 {
-		t.Errorf("overhead 总量 %d，应为 10000", e.Overhead().Total())
+	if e.Overhead().Total() != 5000 {
+		t.Errorf("overhead 总量 %d，应为 5000", e.Overhead().Total())
 	}
 
 	// 口径一致性：overhead 的 token 量与消息本体的 token 量可直接相加比较
 	if base <= 0 {
 		t.Error("消息本体估算为 0，overhead 占比将失真")
+	}
+}
+
+func TestEffectiveTokensCountsSystemPromptOnce(t *testing.T) {
+	e := NewEngine()
+	messages := []*schema.Message{
+		schema.SystemMessage("你是发布助手，必须先检查约束再执行。"),
+		schema.UserMessage("开始发布"),
+	}
+	e.SetOverhead(PromptOverheadSnapshot{ToolsTokens: 321, Multimodal: 123})
+
+	want := EstimateMessagesTokens(messages) + 321 + 123
+	if got := e.effectiveTokens(messages); got != want {
+		t.Fatalf("effectiveTokens = %d，期望 %d；system prompt 应只由消息估算计入一次", got, want)
 	}
 }

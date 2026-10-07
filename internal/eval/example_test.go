@@ -186,3 +186,15 @@ func TestRunnerCollectsAssertionFailures(t *testing.T) {
 		t.Errorf("报告用例名不正确: %q", rep.CaseName)
 	}
 }
+
+func TestRunnerIDsAreUniqueAcrossInstances(t *testing.T) {
+	first := (&eval.Runner{}).Run(context.Background(), eval.Case{
+		Name: "first", Replies: []*schema.Message{schema.AssistantMessage("ok", nil)},
+	})
+	second := (&eval.Runner{}).Run(context.Background(), eval.Case{
+		Name: "second", Replies: []*schema.Message{schema.AssistantMessage("ok", nil)},
+	})
+	if first.RunID == second.RunID {
+		t.Fatalf("不同 Runner 复用了 RunID %q，会串用进程级 checkpoint", first.RunID)
+	}
+}

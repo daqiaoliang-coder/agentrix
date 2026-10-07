@@ -55,16 +55,17 @@ func main() {
 	reg.Register("echo", &builtin.EchoTool{})
 
 	cfg := &scene.SceneConfig{
-		Key:              "echo_scene",
-		Name:             "回显场景",
-		SystemPrompt:     "你是一个测试助手，可以使用 echo 工具回显内容。",
-		Model:            chatModel,
-		Tools:            reg.List(),
-		MaxIterations:    5,
-		TokenBudget:      8192,
-		TotalTimeout:     envDuration("TOTAL_TIMEOUT", 30*time.Second),      // 外层：整个 Turn 总时间预算
-		ModelCallTimeout: envDuration("MODEL_CALL_TIMEOUT", 10*time.Second), // 内层：单次模型调用超时
-		NoProgressLimit:  3,                                                 // 连续 3 轮无新进展则注入收尾提示
+		Key:                "echo_scene",
+		Name:               "回显场景",
+		SystemPrompt:       "你是一个测试助手，可以使用 echo 工具回显内容。",
+		Model:              chatModel,
+		Tools:              reg.List(),
+		MaxIterations:      5,
+		ModelContextWindow: 8192,
+		TokenBudget:        8192,
+		TotalTimeout:       envDuration("TOTAL_TIMEOUT", 30*time.Second),      // 外层：整个 Turn 总时间预算
+		ModelCallTimeout:   envDuration("MODEL_CALL_TIMEOUT", 10*time.Second), // 内层：单次模型调用超时
+		NoProgressLimit:    3,                                                 // 连续 3 轮无新进展则注入收尾提示
 	}
 
 	store := session.NewMemoryStore()

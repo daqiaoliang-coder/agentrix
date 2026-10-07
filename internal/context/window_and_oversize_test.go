@@ -23,15 +23,15 @@ import (
 // maxTailRatio 以内，即使 TailTokenBudget 仍是按大窗口设定的默认值 20000。
 func TestTailBudgetConvergesUnderWindow(t *testing.T) {
 	e := NewEngine()
-	e.TokenBudget = 16384 // 接入方常配的小窗口
+	e.ModelContextWindow = 16384 // 接入方常配的小窗口
 	if e.TailTokenBudget != defaultTailTokenBudget {
 		t.Fatalf("测试前提：TailTokenBudget 应为默认值 %d，实际 %d", defaultTailTokenBudget, e.TailTokenBudget)
 	}
 	got := e.tailBudget()
-	if got >= e.TokenBudget {
-		t.Errorf("尾部保护区 %d 未收敛，仍 >= 窗口 %d，middle 会恒空", got, e.TokenBudget)
+	if got >= e.ModelContextWindow {
+		t.Errorf("尾部保护区 %d 未收敛，仍 >= 窗口 %d，middle 会恒空", got, e.ModelContextWindow)
 	}
-	if want := int(float64(e.TokenBudget) * maxTailRatio); got != want {
+	if want := int(float64(e.ModelContextWindow) * maxTailRatio); got != want {
 		t.Errorf("尾部保护区应收敛到 %d（窗口×maxTailRatio），实际 %d", want, got)
 	}
 }
@@ -55,7 +55,7 @@ func TestSplitByBoundaryKeepsNonEmptyMiddle(t *testing.T) {
 // 但只有 middle 非空才会调用 summarize 并写入——以此证明摘要路径确实执行了。
 func TestSummaryPathExecutesWithSmallWindow(t *testing.T) {
 	e := NewEngine()
-	e.TokenBudget = 16384 // softLimit=13107
+	e.ModelContextWindow = 16384 // softLimit=13107
 	e.SetSpillStore(NewMemorySpillStore())
 
 	state := &session.State{}
@@ -84,7 +84,7 @@ func TestSummaryPathExecutesWithSmallWindow(t *testing.T) {
 // 也会被头尾采样，突破「免死金牌」。原文完整 offload、可回读，头尾保留、中间折叠。
 func TestOversizedResultSampledWithinKeepRecent(t *testing.T) {
 	e := NewEngine()
-	e.TokenBudget = 10000 // softLimit=8000
+	e.ModelContextWindow = 10000 // softLimit=8000
 	spill := NewMemorySpillStore()
 	e.SetSpillStore(spill)
 
@@ -99,7 +99,7 @@ func TestOversizedResultSampledWithinKeepRecent(t *testing.T) {
 	}
 	// 只有 1 条工具结果 ≤ keepRecent，evictToolResults 必然放弃，采样是唯一减负路径
 
-	out := e.CompressInPlace(context.Background(), msgs)
+	out := mustCompressInPlace(t, e, msgs)
 
 	var sampled *schema.Message
 	for _, m := range out {
@@ -139,11 +139,41 @@ func TestOversizedResultSampledWithinKeepRecent(t *testing.T) {
 	}
 }
 
+func TestFourRecentOversizedResultsAreSampled(t *testing.T) {
+	e := NewEngine()
+	e.ModelContextWindow = 10000
+	spill := NewMemorySpillStore()
+	e.SetSpillStore(spill)
+
+	messages := []*schema.Message{schema.SystemMessage("sys")}
+	for i := 0; i < trimKeepRecentTools; i++ {
+		id := "call_recent_" + string(rune('a'+i))
+		messages = append(messages,
+			assistantCall(id, "search"),
+			toolMsg(id, "search", strings.Repeat(string(rune('A'+i)), 12000)),
+		)
+	}
+	if e.effectiveTokens(messages) <= e.contextWindow() {
+		t.Fatalf("测试前提不成立：%d token 未超过窗口 %d", e.effectiveTokens(messages), e.contextWindow())
+	}
+
+	out, stats := mustCompressInPlaceWithStats(t, e, messages)
+	if stats.Sampled != trimKeepRecentTools || stats.Offloaded != trimKeepRecentTools {
+		t.Fatalf("最近四条大结果未全部采样并 offload: %+v", stats)
+	}
+	if e.effectiveTokens(out) > e.contextWindow() {
+		t.Fatalf("采样后仍超窗: %d > %d", e.effectiveTokens(out), e.contextWindow())
+	}
+	if spill.Len() != trimKeepRecentTools {
+		t.Fatalf("Spill 条数 = %d，期望 %d", spill.Len(), trimKeepRecentTools)
+	}
+}
+
 // TestOversizedSamplingIsIdempotent 验证采样幂等：采样后已低于软阈值，
 // 二次 CompressInPlace 不再改写序列、不重复 offload（避免反复作废缓存前缀）。
 func TestOversizedSamplingIsIdempotent(t *testing.T) {
 	e := NewEngine()
-	e.TokenBudget = 10000
+	e.ModelContextWindow = 10000
 	spill := NewMemorySpillStore()
 	e.SetSpillStore(spill)
 
@@ -153,7 +183,7 @@ func TestOversizedSamplingIsIdempotent(t *testing.T) {
 		assistantCall("call_big", "search"),
 		toolMsg("call_big", "search", big),
 	}
-	once := e.CompressInPlace(context.Background(), msgs)
+	once := mustCompressInPlace(t, e, msgs)
 	if e.effectiveTokens(once) > e.softLimit() {
 		t.Skip("一次采样后仍超阈，需配合淘汰，跳过纯幂等断言")
 	}
@@ -161,7 +191,7 @@ func TestOversizedSamplingIsIdempotent(t *testing.T) {
 		t.Fatalf("首次采样应 offload 1 条，实际 %d", spill.Len())
 	}
 
-	twice := e.CompressInPlace(context.Background(), once)
+	twice := mustCompressInPlace(t, e, once)
 	if EstimateMessagesTokens(twice) != EstimateMessagesTokens(once) {
 		t.Errorf("二次压缩改动了已采样序列：%d → %d", EstimateMessagesTokens(once), EstimateMessagesTokens(twice))
 	}
@@ -173,7 +203,7 @@ func TestOversizedSamplingIsIdempotent(t *testing.T) {
 // TestSmallResultsNotSampled 验证低于阈值的小结果不被采样（不误伤）。
 func TestSmallResultsNotSampled(t *testing.T) {
 	e := NewEngine()
-	e.TokenBudget = 10000
+	e.ModelContextWindow = 10000
 	e.SetSpillStore(NewMemorySpillStore())
 
 	small := strings.Repeat("c", 400) // ≈200 token，远低于 threshold=1200
@@ -199,7 +229,7 @@ func TestSmallResultsNotSampled(t *testing.T) {
 // 非幂等（写类）工具结果不被采样——采样会永久丢失中段，而写结果不可重放。
 func TestOversizedNonIdempotentNotSampledWithoutSpill(t *testing.T) {
 	e := NewEngine()
-	e.TokenBudget = 10000
+	e.ModelContextWindow = 10000
 	e.IsNonIdempotent = func(name string) bool { return name == "edit" }
 	// 故意不设 SpillStore
 

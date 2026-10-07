@@ -30,6 +30,7 @@ func BuildAgentGraph(
 	chatModel model.ToolCallingChatModel,
 	tools []tool.BaseTool,
 	maxIterations int,
+	checkpointStore hitl.CheckPointStore,
 ) (compose.Runnable[[]*schema.Message, *schema.Message], error) {
 
 	// ① 创建有环图：输入消息历史，输出最终回复
@@ -80,15 +81,18 @@ func BuildAgentGraph(
 		maxIterations = 8
 	}
 
-	// 检查点存储必须进程级共享：Agent 每次请求重建，若每次新建存储，
-	// 审批中断写入的 Checkpoint 会随旧图丢弃，Resume 必然失败。
-	store := hitl.DefaultCheckPointStore()
+	if checkpointStore == nil {
+		return nil, fmt.Errorf("checkpoint store is nil")
+	}
+	if _, ok := checkpointStore.(hitl.CheckPointDeleter); !ok {
+		return nil, fmt.Errorf("checkpoint store %T does not support deletion", checkpointStore)
+	}
 
 	// ⑥ 编译：有环图必须设置 MaxRunSteps 防止无限循环
 	runnable, err := graph.Compile(ctx,
 		compose.WithMaxRunSteps(maxIterations*2+2), // 每轮约 2 步
 		compose.WithNodeTriggerMode(compose.AnyPredecessor),
-		compose.WithCheckPointStore(store), // 检查点
+		compose.WithCheckPointStore(checkpointStore), // 检查点
 	)
 	if err != nil {
 		return nil, fmt.Errorf("compile graph: %w", err)

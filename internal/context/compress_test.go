@@ -2,6 +2,7 @@ package context
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -40,18 +41,46 @@ func buildToolHistory(n, chars int) []*schema.Message {
 	return msgs
 }
 
+func mustCompressInPlace(tb testing.TB, e *Engine, messages []*schema.Message) []*schema.Message {
+	tb.Helper()
+	out, err := e.CompressInPlace(context.Background(), messages)
+	if err != nil {
+		tb.Fatalf("CompressInPlace: %v", err)
+	}
+	return out
+}
+
+func mustCompressInPlaceWithStats(tb testing.TB, e *Engine, messages []*schema.Message) ([]*schema.Message, CompressStats) {
+	tb.Helper()
+	out, stats, err := e.CompressInPlaceWithStats(context.Background(), messages)
+	if err != nil {
+		tb.Fatalf("CompressInPlaceWithStats: %v", err)
+	}
+	return out, stats
+}
+
+type failingSpillStore struct{}
+
+func (failingSpillStore) Spill(context.Context, string, string) error {
+	return errors.New("spill failed")
+}
+
+func (failingSpillStore) Read(context.Context, string) (string, error) {
+	return "", errors.New("read failed")
+}
+
 // TestCompressInPlaceSkipsWhenUnderSoftLimit 验证 need-driven 纪律：
 // 未越 softLimit 时消息序列必须原样返回，一条都不动。
 // 这是修复「每轮无条件裁剪破坏 KV 缓存前缀」的核心断言。
 func TestCompressInPlaceSkipsWhenUnderSoftLimit(t *testing.T) {
 	e := NewEngine()
-	e.TokenBudget = 100000 // softLimit = 80000，远超测试消息体量
+	e.ModelContextWindow = 100000 // softLimit = 80000，远超测试消息体量
 	e.SetSpillStore(NewMemorySpillStore())
 
 	msgs := buildToolHistory(10, 200)
 	before := EstimateMessagesTokens(msgs)
 
-	out := e.CompressInPlace(context.Background(), msgs)
+	out := mustCompressInPlace(t, e, msgs)
 
 	if EstimateMessagesTokens(out) != before {
 		t.Errorf("未超阈值却改动了消息：token %d → %d", before, EstimateMessagesTokens(out))
@@ -67,11 +96,186 @@ func TestCompressInPlaceSkipsWhenUnderSoftLimit(t *testing.T) {
 	}
 }
 
+func TestCompressionThresholdBoundaryIsConsistent(t *testing.T) {
+	messages := buildToolHistory(10, 1200)
+	probe := NewEngine()
+	before := probe.effectiveTokens(messages)
+
+	for _, tc := range []struct {
+		name   string
+		window int
+		want   bool
+	}{
+		{name: "below", window: before + 1, want: false},
+		{name: "equal", window: before, want: true},
+		{name: "above", window: before - 1, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := NewEngine()
+			e.CompressThreshold = 1
+			e.ModelContextWindow = tc.window
+			if got := e.shouldCompress(messages); got != tc.want {
+				t.Fatalf("shouldCompress = %v，期望 %v", got, tc.want)
+			}
+		})
+	}
+
+	inPlace := NewEngine()
+	inPlace.CompressThreshold = 1
+	inPlace.ModelContextWindow = before
+	_, inPlaceStats := mustCompressInPlaceWithStats(t, inPlace, messages)
+	if !inPlaceStats.Triggered {
+		t.Fatal("循环内压缩在 effectiveTokens == softLimit 时未触发")
+	}
+
+	assemble := NewEngine()
+	systemPrompt := "你是测试助手"
+	userInput := "继续"
+	assembled := make([]*schema.Message, 0, len(messages)+2)
+	assembled = append(assembled, schema.SystemMessage(systemPrompt))
+	assembled = append(assembled, messages...)
+	assembled = append(assembled, schema.UserMessage(userInput))
+	assemble.CompressThreshold = 1
+	assemble.ModelContextWindow = assemble.effectiveTokens(assembled)
+	_, assembleStats, err := assemble.AssembleWithStats(context.Background(), systemPrompt, nil, messages, userInput)
+	if err != nil {
+		t.Fatalf("AssembleWithStats: %v", err)
+	}
+	if !assembleStats.Triggered {
+		t.Fatal("初始装配在 effectiveTokens == softLimit 时未触发")
+	}
+}
+
+func TestAssembleRejectsOversizedCurrentInput(t *testing.T) {
+	const secret = "sensitive-user-payload"
+	e := NewEngine()
+	e.ModelContextWindow = 100
+
+	_, err := e.Assemble(context.Background(), "sys", nil, nil, strings.Repeat(secret, 100))
+	if !errors.Is(err, ErrContextWindowExceeded) {
+		t.Fatalf("错误 = %v，期望 ErrContextWindowExceeded", err)
+	}
+	var limitErr *ContextWindowExceededError
+	if !errors.As(err, &limitErr) {
+		t.Fatalf("错误类型 = %T，期望 *ContextWindowExceededError", err)
+	}
+	if limitErr.Window != 100 || limitErr.Tokens <= limitErr.Window {
+		t.Fatalf("错误容量信息不正确: %+v", limitErr)
+	}
+	if limitErr.Reason != ContextWindowReasonCurrentInput {
+		t.Fatalf("错误原因 = %q，期望 %q", limitErr.Reason, ContextWindowReasonCurrentInput)
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatal("超窗错误泄露了原始用户内容")
+	}
+}
+
+func TestAssembleRejectsOversizedSystemPrompt(t *testing.T) {
+	const secret = "sensitive-system-payload"
+	e := NewEngine()
+	e.ModelContextWindow = 100
+
+	_, err := e.Assemble(context.Background(), strings.Repeat(secret, 100), nil, nil, "ok")
+	var limitErr *ContextWindowExceededError
+	if !errors.As(err, &limitErr) {
+		t.Fatalf("错误 = %v，期望 *ContextWindowExceededError", err)
+	}
+	if limitErr.Reason != ContextWindowReasonProtectedContext {
+		t.Fatalf("错误原因 = %q，期望 %q", limitErr.Reason, ContextWindowReasonProtectedContext)
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatal("超窗错误泄露了原始 system prompt")
+	}
+}
+
+func TestInPlaceRejectsNonIdempotentResultBeyondWindow(t *testing.T) {
+	e := NewEngine()
+	e.ModelContextWindow = 100
+	e.IsNonIdempotent = func(name string) bool { return name == "write" }
+	messages := []*schema.Message{
+		schema.SystemMessage("sys"),
+		assistantCall("call_write", "write"),
+		toolMsg("call_write", "write", strings.Repeat("result", 200)),
+	}
+
+	_, err := e.CompressInPlace(context.Background(), messages)
+	var limitErr *ContextWindowExceededError
+	if !errors.As(err, &limitErr) {
+		t.Fatalf("错误 = %v，期望 *ContextWindowExceededError", err)
+	}
+	if limitErr.Reason != ContextWindowReasonNonIdempotentTool {
+		t.Fatalf("错误原因 = %q，期望 %q", limitErr.Reason, ContextWindowReasonNonIdempotentTool)
+	}
+}
+
+func TestInPlaceRejectsAllNonIdempotentResultsBeyondWindow(t *testing.T) {
+	e := NewEngine()
+	e.ModelContextWindow = 1000
+	e.IsNonIdempotent = func(string) bool { return true }
+	messages := buildToolHistory(8, 1200)
+
+	out, stats, err := e.CompressInPlaceWithStats(context.Background(), messages)
+	var limitErr *ContextWindowExceededError
+	if !errors.As(err, &limitErr) {
+		t.Fatalf("错误 = %v，期望 *ContextWindowExceededError", err)
+	}
+	if limitErr.Reason != ContextWindowReasonNonIdempotentTool {
+		t.Fatalf("错误原因 = %q，期望 %q", limitErr.Reason, ContextWindowReasonNonIdempotentTool)
+	}
+	if stats.Sampled != 0 || stats.Evicted != 0 || stats.Triggered {
+		t.Fatalf("非幂等结果不应被改写: %+v", stats)
+	}
+	for i := range messages {
+		if out[i].Content != messages[i].Content {
+			t.Fatalf("第 %d 条非幂等消息被改写", i)
+		}
+	}
+}
+
+func TestInPlacePreservesResultsWhenSpillFails(t *testing.T) {
+	e := NewEngine()
+	e.ModelContextWindow = 1000
+	e.SetSpillStore(failingSpillStore{})
+	messages := []*schema.Message{
+		schema.SystemMessage("sys"),
+		assistantCall("call_big", "search"),
+		toolMsg("call_big", "search", strings.Repeat("result", 2000)),
+	}
+
+	out, stats, err := e.CompressInPlaceWithStats(context.Background(), messages)
+	var limitErr *ContextWindowExceededError
+	if !errors.As(err, &limitErr) {
+		t.Fatalf("错误 = %v，期望 *ContextWindowExceededError", err)
+	}
+	if stats.Sampled != 0 || stats.Evicted != 0 || stats.Offloaded != 0 || stats.Triggered {
+		t.Fatalf("Spill 失败后不应报告压缩成功: %+v", stats)
+	}
+	if out[2].Content != messages[2].Content || isStub(out[2]) {
+		t.Fatal("Spill 失败后工具结果未保留原文")
+	}
+}
+
+func TestEvictionPreservesResultsWhenSpillFails(t *testing.T) {
+	e := NewEngine()
+	e.SetSpillStore(failingSpillStore{})
+	messages := buildToolHistory(8, 400)
+
+	out, evicted, offloaded := e.evictToolResultsCounted(context.Background(), messages, trimKeepRecentTools, 1)
+	if evicted != 0 || offloaded != 0 {
+		t.Fatalf("Spill 失败后不应淘汰结果: evicted=%d offloaded=%d", evicted, offloaded)
+	}
+	for i := range messages {
+		if out[i].Content != messages[i].Content || isStub(out[i]) {
+			t.Fatalf("Spill 失败后第 %d 条消息被改写", i)
+		}
+	}
+}
+
 // TestCompressInPlaceEvictsToLowWater 验证越阈值后 oldest-first + clear_at_least：
 // 一次清理到低水位以下即停，且保留最近 keepRecent 条原文。
 func TestCompressInPlaceEvictsToLowWater(t *testing.T) {
 	e := NewEngine()
-	e.TokenBudget = 10000 // softLimit=8000, lowWater=6500
+	e.ModelContextWindow = 10000 // softLimit=8000, lowWater=6500
 	spill := NewMemorySpillStore()
 	e.SetSpillStore(spill)
 
@@ -84,7 +288,7 @@ func TestCompressInPlaceEvictsToLowWater(t *testing.T) {
 			e.effectiveTokens(msgs), e.softLimit())
 	}
 
-	out := e.CompressInPlace(context.Background(), msgs)
+	out := mustCompressInPlace(t, e, msgs)
 
 	if got := e.effectiveTokens(out); got > e.lowWater() {
 		t.Errorf("清理后 token %d 仍高于低水位 %d", got, e.lowWater())
@@ -111,7 +315,7 @@ func TestCompressInPlaceEvictsToLowWater(t *testing.T) {
 // TestEvictKeepsRecentToolResults 验证 Survivor 语义：最近 keepRecent 条工具结果不被淘汰。
 func TestEvictKeepsRecentToolResults(t *testing.T) {
 	e := NewEngine()
-	e.TokenBudget = 1000 // 阈值压得极低，强制淘汰尽可能多的候选
+	e.ModelContextWindow = 1000 // 阈值压得极低，强制淘汰尽可能多的候选
 	spill := NewMemorySpillStore()
 	e.SetSpillStore(spill)
 
@@ -139,7 +343,7 @@ func TestEvictKeepsRecentToolResults(t *testing.T) {
 // 这类结果无法重放，淘汰即永久丢失。
 func TestEvictSkipsNonIdempotentTool(t *testing.T) {
 	e := NewEngine()
-	e.TokenBudget = 1000
+	e.ModelContextWindow = 1000
 	e.IsNonIdempotent = func(name string) bool { return name == "edit_draft" }
 	spill := NewMemorySpillStore()
 	e.SetSpillStore(spill)
@@ -179,7 +383,7 @@ func TestEvictSkipsNonIdempotentTool(t *testing.T) {
 // stub 必须保留工具身份与恢复路径，而不是无意义的 [truncated]。
 func TestEvictedStubCarriesRecoveryPath(t *testing.T) {
 	e := NewEngine()
-	e.TokenBudget = 1000
+	e.ModelContextWindow = 1000
 	spill := NewMemorySpillStore()
 	e.SetSpillStore(spill)
 
@@ -210,7 +414,7 @@ func TestEvictedStubCarriesRecoveryPath(t *testing.T) {
 // TestOffloadedContentIsReadable 验证 offload 可恢复：被淘汰的原文能从 SpillStore 完整取回。
 func TestOffloadedContentIsReadable(t *testing.T) {
 	e := NewEngine()
-	e.TokenBudget = 1000
+	e.ModelContextWindow = 1000
 	spill := NewMemorySpillStore()
 	e.SetSpillStore(spill)
 
@@ -248,7 +452,7 @@ func TestOffloadedContentIsReadable(t *testing.T) {
 // stub 必须明确告知不可回读，避免模型误以为能取回而幻觉等待。
 func TestWithoutSpillStoreStubSaysUnrecoverable(t *testing.T) {
 	e := NewEngine()
-	e.TokenBudget = 1000
+	e.ModelContextWindow = 1000
 	// 故意不设置 SpillStore
 
 	msgs := buildToolHistory(8, 400)
@@ -272,11 +476,11 @@ func TestWithoutSpillStoreStubSaysUnrecoverable(t *testing.T) {
 	}
 }
 
-// TestEffectiveTokensCountsOverhead 验证改动 2 的核心：
-// 系统提示与工具 schema 的固定开销必须计入压缩判断，否则阈值失真、压缩触发过晚。
+// TestEffectiveTokensCountsOverhead 验证不在 messages 中的工具 schema 固定开销
+// 必须计入压缩判断，否则阈值失真、压缩触发过晚。
 func TestEffectiveTokensCountsOverhead(t *testing.T) {
 	e := NewEngine()
-	e.TokenBudget = 10000 // softLimit = 8000
+	e.ModelContextWindow = 10000 // softLimit = 8000
 
 	// 消息本体很小，远不到 softLimit
 	msgs := buildToolHistory(10, 200)
@@ -287,8 +491,8 @@ func TestEffectiveTokensCountsOverhead(t *testing.T) {
 		t.Fatal("无 overhead 时不应触发压缩")
 	}
 
-	// 注入大额 overhead（模拟庞大的系统提示 + 技能索引 + 工具 schema）
-	e.SetOverhead(PromptOverheadSnapshot{SystemTokens: 5000, ToolsTokens: 4000})
+	// 注入大额 overhead（模拟庞大的工具 schema）
+	e.SetOverhead(PromptOverheadSnapshot{ToolsTokens: 9000})
 
 	if got := e.effectiveTokens(msgs); got != EstimateMessagesTokens(msgs)+9000 {
 		t.Errorf("effectiveTokens 未计入 overhead：期望 %d，实际 %d", EstimateMessagesTokens(msgs)+9000, got)
@@ -302,12 +506,12 @@ func TestEffectiveTokensCountsOverhead(t *testing.T) {
 // 重复压缩不会反复改写同一段历史（避免 creep 失真与无谓的缓存作废）。
 func TestCompressInPlaceIsIdempotent(t *testing.T) {
 	e := NewEngine()
-	e.TokenBudget = 10000
+	e.ModelContextWindow = 10000
 	spill := NewMemorySpillStore()
 	e.SetSpillStore(spill)
 
 	msgs := buildToolHistory(20, 1600)
-	once := e.CompressInPlace(context.Background(), msgs)
+	once := mustCompressInPlace(t, e, msgs)
 	if !e.shouldCompress(msgs) {
 		t.Fatalf("测试前提不成立：%d token 未越 softLimit %d，幂等断言将空转",
 			e.effectiveTokens(msgs), e.softLimit())
@@ -317,7 +521,7 @@ func TestCompressInPlaceIsIdempotent(t *testing.T) {
 		t.Fatal("首次压缩未产生 offload，幂等断言将空转")
 	}
 
-	twice := e.CompressInPlace(context.Background(), once)
+	twice := mustCompressInPlace(t, e, once)
 	if spill.Len() != firstLen {
 		t.Errorf("二次压缩重复 offload：%d → %d 条", firstLen, spill.Len())
 	}
@@ -331,11 +535,11 @@ func TestCompressInPlaceIsIdempotent(t *testing.T) {
 // 每个 tool 结果都有对应的 tool_call 声明，每个声明都有结果，否则模型调用直接报错。
 func TestEvictPreservesToolCallPairing(t *testing.T) {
 	e := NewEngine()
-	e.TokenBudget = 1000
+	e.ModelContextWindow = 1000
 	e.SetSpillStore(NewMemorySpillStore())
 
 	msgs := buildToolHistory(10, 400)
-	out := e.CompressInPlace(context.Background(), msgs)
+	out := mustCompressInPlace(t, e, msgs)
 
 	declared := map[string]bool{}
 	for _, m := range out {

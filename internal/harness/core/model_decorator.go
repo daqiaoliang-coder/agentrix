@@ -87,7 +87,11 @@ func (m *BudgetModel) Generate(
 	// Budget 经 ctx 传入、天然按 Turn 隔离，记在它身上才是对的归属。
 	if m.cfg.Engine != nil {
 		var stats ctxengine.CompressStats
-		input, stats = m.cfg.Engine.CompressInPlaceWithStats(ctx, input)
+		var compressErr error
+		input, stats, compressErr = m.cfg.Engine.CompressInPlaceWithStats(ctx, input)
+		if compressErr != nil {
+			return nil, compressErr
+		}
 		// 只在真的改写了序列时记账：未越阈值的轮次占绝大多数，
 		// 全记进去会让 CompressEvents 退化成「模型调用次数」，
 		// 失去「压缩触发频率」这个指标的意义。
@@ -186,7 +190,11 @@ func (m *BudgetModel) Stream(
 ) (*schema.StreamReader[*schema.Message], error) {
 
 	if m.cfg.Engine != nil {
-		input = m.cfg.Engine.CompressInPlace(ctx, input)
+		var err error
+		input, err = m.cfg.Engine.CompressInPlace(ctx, input)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return m.raw.Stream(ctx, input, opts...)
 }

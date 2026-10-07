@@ -109,7 +109,7 @@ func TestInContextRecallDegradesButTotalRecallHolds(t *testing.T) {
 
 	t.Run("配置SpillStore时事实可回读", func(t *testing.T) {
 		e := NewEngine()
-		e.TokenBudget = 8000 // 压低窗口，迫使激进压缩
+		e.ModelContextWindow = 8000 // 压低窗口，迫使激进压缩
 		spill := NewMemorySpillStore()
 		e.SetSpillStore(spill)
 
@@ -118,7 +118,7 @@ func TestInContextRecallDegradesButTotalRecallHolds(t *testing.T) {
 			t.Fatalf("夹具构造失败：植入的事实不在预期消息里")
 		}
 
-		out := e.CompressInPlace(context.Background(), msgs)
+		out := mustCompressInPlace(t, e, msgs)
 		r := measureRecall(out, spill, fact, toolCallID)
 
 		if !r.total {
@@ -131,11 +131,11 @@ func TestInContextRecallDegradesButTotalRecallHolds(t *testing.T) {
 
 	t.Run("未配置SpillStore时召回全部丢失", func(t *testing.T) {
 		e := NewEngine()
-		e.TokenBudget = 8000
+		e.ModelContextWindow = 8000
 		// 故意不配 SpillStore
 
 		msgs := plantFact(20, 1200, plantIdx, fact)
-		out := e.CompressInPlace(context.Background(), msgs)
+		out := mustCompressInPlace(t, e, msgs)
 		r := measureRecall(out, nil, fact, toolCallID)
 
 		if r.total && !r.inContext {
@@ -145,7 +145,7 @@ func TestInContextRecallDegradesButTotalRecallHolds(t *testing.T) {
 			t.Errorf("未配 spill 时 TotalRecall 应等于 InContextRecall：%v vs %v", r.total, r.inContext)
 		}
 		// 此时不可恢复丢失必须被如实计数，否则代价被隐藏
-		_, stats := e.CompressInPlaceWithStats(context.Background(), plantFact(20, 1200, plantIdx, fact))
+		_, stats := mustCompressInPlaceWithStats(t, e, plantFact(20, 1200, plantIdx, fact))
 		if stats.Evicted > 0 && stats.UnrecoverableLost < stats.Evicted {
 			t.Errorf("淘汰 %d 条但不可恢复丢失只记了 %d 条", stats.Evicted, stats.UnrecoverableLost)
 		}
@@ -162,11 +162,11 @@ func TestRecallOfRecentFactAlwaysPreserved(t *testing.T) {
 	toolCallID := fmt.Sprintf("call_%02d", plantIdx)
 
 	e := NewEngine()
-	e.TokenBudget = 8000
+	e.ModelContextWindow = 8000
 	e.SetSpillStore(NewMemorySpillStore())
 
 	msgs := plantFact(20, 1200, plantIdx, fact)
-	out := e.CompressInPlace(context.Background(), msgs)
+	out := mustCompressInPlace(t, e, msgs)
 
 	r := measureRecall(out, e.spillStore(), fact, toolCallID)
 	if !r.inContext {
@@ -183,11 +183,11 @@ func TestRecallOfRecentFactAlwaysPreserved(t *testing.T) {
 // 那是数据丢失而不是设计意图，必须暴露出来。
 func TestRecoverabilityRatioIsOneWithSpill(t *testing.T) {
 	e := NewEngine()
-	e.TokenBudget = 10000
+	e.ModelContextWindow = 10000
 	e.SetSpillStore(NewMemorySpillStore())
 
 	msgs := buildToolHistory(20, 1600)
-	_, stats := e.CompressInPlaceWithStats(context.Background(), msgs)
+	_, stats := mustCompressInPlaceWithStats(t, e, msgs)
 
 	touched := stats.Sampled + stats.Evicted
 	if touched == 0 {
@@ -214,7 +214,7 @@ func TestRecoverabilityRatioIsOneWithSpill(t *testing.T) {
 // 前缀长度趋近 0，provider 侧 KV 缓存全废，压缩就是净亏损。
 func TestStablePrefixHoldsAcrossRoundsWhenUnderThreshold(t *testing.T) {
 	e := NewEngine()
-	e.TokenBudget = 100000 // 远超测试体量，确保不触发压缩
+	e.ModelContextWindow = 100000 // 远超测试体量，确保不触发压缩
 	e.SetSpillStore(NewMemorySpillStore())
 
 	base := buildToolHistory(10, 200)
@@ -227,7 +227,7 @@ func TestStablePrefixHoldsAcrossRoundsWhenUnderThreshold(t *testing.T) {
 	current := base
 	for round := 0; round < 5; round++ {
 		before := EstimateMessagesTokens(current)
-		out := e.CompressInPlace(context.Background(), current)
+		out := mustCompressInPlace(t, e, current)
 
 		if got := stablePrefixTokens(current, out); got != before {
 			t.Errorf("第 %d 轮未越阈值却改写了前缀：稳定前缀 %d != 原序列 %d",
@@ -248,13 +248,13 @@ func TestStablePrefixHoldsAcrossRoundsWhenUnderThreshold(t *testing.T) {
 // 度量值必须大于 0 且小于全量——为 0 说明连头部都被动了，等于全量缓存失效。
 func TestStablePrefixShrinksOnlyFromFirstRewrite(t *testing.T) {
 	e := NewEngine()
-	e.TokenBudget = 10000
+	e.ModelContextWindow = 10000
 	e.SetSpillStore(NewMemorySpillStore())
 
 	msgs := buildToolHistory(20, 1600)
 	full := EstimateMessagesTokens(msgs)
 
-	out, stats := e.CompressInPlaceWithStats(context.Background(), msgs)
+	out, stats := mustCompressInPlaceWithStats(t, e, msgs)
 	if !stats.Triggered {
 		t.Fatal("未触发压缩，无法验证前缀度量")
 	}
@@ -283,7 +283,7 @@ func TestStablePrefixShrinksOnlyFromFirstRewrite(t *testing.T) {
 // 这是「压缩越压越大」这类隐蔽退化的唯一检测手段。
 func TestCumulativeCompressionDoesNotLeakTokens(t *testing.T) {
 	e := NewEngine()
-	e.TokenBudget = 10000
+	e.ModelContextWindow = 10000
 	spill := NewMemorySpillStore()
 	e.SetSpillStore(spill)
 
@@ -292,7 +292,7 @@ func TestCumulativeCompressionDoesNotLeakTokens(t *testing.T) {
 	prev := 0
 
 	for round := 1; round <= 5; round++ {
-		out := e.CompressInPlace(context.Background(), current)
+		out := mustCompressInPlace(t, e, current)
 		now := e.effectiveTokens(out)
 
 		if now > first {
@@ -313,13 +313,13 @@ func TestCumulativeCompressionDoesNotLeakTokens(t *testing.T) {
 // 而 SpillRef 由 tool_call_id 生成，天然幂等——这条测试守住这个性质。
 func TestOffloadDoesNotDuplicateAcrossRounds(t *testing.T) {
 	e := NewEngine()
-	e.TokenBudget = 10000
+	e.ModelContextWindow = 10000
 	spill := NewMemorySpillStore()
 	e.SetSpillStore(spill)
 
 	current := buildToolHistory(20, 1600)
 	for round := 0; round < 4; round++ {
-		current = e.CompressInPlace(context.Background(), current)
+		current = mustCompressInPlace(t, e, current)
 	}
 	// 20 条工具结果，最多只可能有 20 份原文
 	if spill.Len() > 20 {
@@ -359,13 +359,13 @@ func TestThresholdSweepTradeoffCurve(t *testing.T) {
 	triggeredCount := 0
 	for _, th := range thresholds {
 		e := NewEngine()
-		e.TokenBudget = 12000
+		e.ModelContextWindow = 12000
 		e.CompressThreshold = th
 		spill := NewMemorySpillStore()
 		e.SetSpillStore(spill)
 
 		msgs := plantFact(rounds, chars, plantIdx, fact)
-		out, stats := e.CompressInPlaceWithStats(context.Background(), msgs)
+		out, stats := mustCompressInPlaceWithStats(t, e, msgs)
 
 		// 扫描前提：每一档都必须真的触发压缩，否则该档数据无意义
 		if !stats.Triggered {
@@ -420,7 +420,7 @@ func TestLowWaterMustStayBelowSoftLimit(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := NewEngine()
-			e.TokenBudget = tc.budget
+			e.ModelContextWindow = tc.budget
 			e.CompressThreshold = tc.compressThreshold
 			e.LowWaterRatio = tc.lowWaterRatio
 
@@ -512,11 +512,12 @@ func BenchmarkCompressInPlace(b *testing.B) {
 		{"未越阈值_直接返回", 200000, 20, 1600},
 		{"越阈值_淘汰为主", 10000, 20, 1600},
 		{"越阈值_巨型结果采样", 10000, 3, 40000},
+		{"大量小结果", 20000, 100, 800},
 		{"大历史", 20000, 100, 1600},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
 			e := NewEngine()
-			e.TokenBudget = tc.budget
+			e.ModelContextWindow = tc.budget
 			e.SetSpillStore(NewMemorySpillStore())
 
 			msgs := buildToolHistory(tc.rounds, tc.chars)
@@ -533,7 +534,7 @@ func BenchmarkCompressInPlace(b *testing.B) {
 				e.SetSpillStore(NewMemorySpillStore())
 				b.StartTimer()
 
-				_, stats := e.CompressInPlaceWithStats(context.Background(), fresh)
+				_, stats := mustCompressInPlaceWithStats(b, e, fresh)
 				lastRatio = stats.CompressionRatio()
 			}
 			b.ReportMetric(lastRatio*100, "compress%")
@@ -547,7 +548,7 @@ func BenchmarkCompressInPlace(b *testing.B) {
 func BenchmarkAssembleWithSummary(b *testing.B) {
 	fake := newFakeSummaryModel(schema.AssistantMessage(wellFormedSummary(), nil))
 	e := NewEngineWithModel(fake)
-	e.TokenBudget = 16384
+	e.ModelContextWindow = 16384
 	e.SetSpillStore(NewMemorySpillStore())
 
 	msgs := buildToolHistory(30, 1800)

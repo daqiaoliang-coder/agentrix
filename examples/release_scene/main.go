@@ -343,16 +343,17 @@ func NewSceneConfig(m einomodel.ToolCallingChatModel, tools []einotool.BaseTool)
 		Name: "发布灰度管理",
 		SystemPrompt: "你是发布变更助手。处理任何具体操作前，" +
 			"必须先用 read_skill 读取技能入口文档，再读取对应细则文档，严格按细则执行。",
-		Model:            m,
-		Tools:            tools,
-		Skills:           buildSkills(),
-		Catalog:          buildCatalog(),
-		AllowedCommands:  AllowedCommands,
-		MaxIterations:    8,
-		TokenBudget:      16384,
-		TotalTimeout:     2 * time.Minute,
-		ModelCallTimeout: 20 * time.Second,
-		NoProgressLimit:  3,
+		Model:              m,
+		Tools:              tools,
+		Skills:             buildSkills(),
+		Catalog:            buildCatalog(),
+		AllowedCommands:    AllowedCommands,
+		MaxIterations:      8,
+		ModelContextWindow: 16384,
+		TokenBudget:        16384,
+		TotalTimeout:       2 * time.Minute,
+		ModelCallTimeout:   20 * time.Second,
+		NoProgressLimit:    3,
 	}
 }
 
