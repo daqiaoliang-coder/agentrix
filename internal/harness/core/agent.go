@@ -93,7 +93,12 @@ func buildRuntime(
 	checkpointStore hitl.CheckPointStore,
 ) (*ctxengine.Engine, *scene.AssembleResult, compose.Runnable[[]*schema.Message, *schema.Message], error) {
 	// 装配上下文压缩引擎：上下文窗口与 Turn 累计 Token 预算相互独立。
-	engine := ctxengine.NewEngine()
+	var engine *ctxengine.Engine
+	if cfg.SummaryModel != nil {
+		engine = ctxengine.NewEngineWithModel(cfg.SummaryModel)
+	} else {
+		engine = ctxengine.NewEngine()
+	}
 	if cfg.ModelContextWindow > 0 {
 		engine.ModelContextWindow = cfg.ModelContextWindow
 	}
@@ -219,8 +224,8 @@ func computeOverhead(
 //   - OnEnd 输出为 []*schema.Message 的 tool 结果消息（工具结果回填侧）。
 //
 // 多轮 ReAct 时按时间顺序收集：[assistant_tc, results, assistant_tc2, results2, ...]。
-// 仅在 Invoke 成功后消费；中断/失败路径丢弃，避免 Resume 重放同一段交互造成重复追加
-// （中断点前的历史轮次不入审计，装配阶段由 Engine 的 tool 配对修复逻辑兜底）。
+// Invoke 成功后全量追加；审批中断时同样全量追加（见 suspend）——Resume 重跑
+// ToolsNode 不回放其输入消息，恢复后只会捕获到结果；其他失败路径丢弃。
 type toolMsgCollector struct {
 	mu   sync.Mutex
 	msgs []*schema.Message
@@ -289,7 +294,7 @@ func (a *Agent) Run(
 	sessionID string,
 	userInput string,
 ) (*schema.Message, error) {
-	return a.run(ctx, sessionID, userInput, false, nil)
+	return a.run(ctx, sessionID, userInput, nil, nil)
 }
 
 // RunStream 与 Run 行为一致，额外通过 sink 实时推出过程信号（projection.Signal）。
@@ -300,21 +305,21 @@ func (a *Agent) RunStream(
 	userInput string,
 	sink func(projection.Signal),
 ) (*schema.Message, error) {
-	return a.run(ctx, sessionID, userInput, false, sink)
+	return a.run(ctx, sessionID, userInput, nil, sink)
 }
 
 // Resume 从 HITL 中断点恢复执行。
 //
 // 与 Run 的关键区别：不带 ForceNewRun，eino 会从 CheckPointStore 载入
 // 中断时保存的图状态继续执行；input 由检查点提供，故此处传空字符串。
+// interruptID 须与会话挂起的中断点一致，且同一审批只能被认领一次。
 func (a *Agent) Resume(
 	ctx context.Context,
 	sessionID string,
 	interruptID string,
 	decision *hitl.ApprovalDecision,
 ) (*schema.Message, error) {
-	resumeCtx := hitl.ResumeWithDecision(ctx, interruptID, decision)
-	return a.run(resumeCtx, sessionID, "", true, nil)
+	return a.run(ctx, sessionID, "", &resumeRequest{interruptID: interruptID, decision: decision}, nil)
 }
 
 // ResumeStream 是 Resume 的流式变体，恢复执行的过程信号经 sink 推出。
@@ -325,19 +330,19 @@ func (a *Agent) ResumeStream(
 	decision *hitl.ApprovalDecision,
 	sink func(projection.Signal),
 ) (*schema.Message, error) {
-	resumeCtx := hitl.ResumeWithDecision(ctx, interruptID, decision)
-	return a.run(resumeCtx, sessionID, "", true, sink)
+	return a.run(ctx, sessionID, "", &resumeRequest{interruptID: interruptID, decision: decision}, sink)
 }
 
-// run 是 Run/Resume 及各自流式变体的共享实现。resuming 为 true 时从检查点
+// run 是 Run/Resume 及各自流式变体的共享实现。resume 非 nil 时从检查点
 // 恢复而非重新开始；sink 非 nil 时发射过程信号，为 nil 时信号发射零成本。
 func (a *Agent) run(
 	ctx context.Context,
 	sessionID string,
 	userInput string,
-	resuming bool,
+	resume *resumeRequest,
 	sink func(projection.Signal),
 ) (out *schema.Message, retErr error) {
+	resuming := resume != nil
 
 	// ① 外层超时（双层超时之外层）：覆盖整个 Turn 的总时间预算
 	if a.cfg.TotalTimeout > 0 {
@@ -346,10 +351,28 @@ func (a *Agent) run(
 		defer cancel()
 	}
 
+	// 会话执行租约：同一会话的 Run/Resume 串行执行，并发 Resume 同一审批
+	// 不会重复执行写工具。
+	ctx, releaseLease, err := a.holdSessionLease(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseLease()
+	defer func() { retErr = wrapLeaseLost(ctx, retErr) }()
+
+	// 工作记忆先于执行加载：Resume 须据 HitlState 认领审批，新 Turn 须放弃
+	// 未完成的审批。
+	state, err := a.store.LoadState(ctx, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("load state: %w", err)
+	}
 	if resuming {
-		if err := a.requireCheckpoint(ctx, sessionID); err != nil {
+		if err := a.claimResume(ctx, sessionID, state, resume.interruptID); err != nil {
 			return nil, err
 		}
+		ctx = hitl.ResumeWithDecision(ctx, resume.interruptID, resume.decision)
+	} else if err := a.abandonPendingApproval(ctx, sessionID, state); err != nil {
+		return nil, err
 	}
 
 	// ② 构造并注入 Budget（按 Turn）：token 预算 + 迭代上限 + deadline
@@ -385,11 +408,7 @@ func (a *Agent) run(
 	emitter := projection.NewEmitter(sessionID, turnID, sink)
 	emitter.Emit(projection.TurnStart, map[string]any{"input": userInput, "resuming": resuming})
 
-	// ③ 加载 SessionState + RawHistory
-	state, err := a.store.LoadState(ctx, sessionID)
-	if err != nil {
-		return nil, fmt.Errorf("load state: %w", err)
-	}
+	// ③ 加载 RawHistory（SessionState 已在租约内加载）
 	history, err := a.store.LoadHistory(ctx, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("load history: %w", err)
@@ -442,8 +461,12 @@ func (a *Agent) run(
 	// 图输出流拼接后还原最终消息，与 Invoke 路径语义一致。
 	output, err := a.execute(ctx, messages, sink != nil, invokeOpts)
 	if err != nil {
-		// 审批中断也是运行事实：让外层能实时感知「正在等待人工授权」
+		// 审批中断也是运行事实：先落盘挂起状态，再让外层感知「正在等待人工授权」。
+		// 落盘失败按失败返回而非 202：工作记忆不是 SUSPENDED，该中断无法被恢复。
 		if approval, ok := ExtractApprovalRequired(err); ok {
+			if serr := a.suspend(ctx, sessionID, state, userInput, resuming, capture.snapshot(), approval); serr != nil {
+				return nil, serr
+			}
 			emitter.Emit(projection.ApproveRequested, approval.Request)
 			outcome = "approval_required"
 		}
@@ -451,12 +474,13 @@ func (a *Agent) run(
 	}
 
 	// ⑥ 追加 RawHistory（append-only）：user 输入 → 图内工具交互 → 最终输出
-	//    恢复模式没有新的用户输入，跳过 user 消息避免写入空记录。
-	newMsgs := make([]*schema.Message, 0, len(capture.msgs)+2)
+	//    恢复模式的用户输入与中断前交互已在中断时落盘，这里只追加恢复后的部分。
+	captured := capture.snapshot()
+	newMsgs := make([]*schema.Message, 0, len(captured)+2)
 	if !resuming {
 		newMsgs = append(newMsgs, schema.UserMessage(userInput))
 	}
-	newMsgs = append(newMsgs, capture.snapshot()...)
+	newMsgs = append(newMsgs, captured...)
 	newMsgs = append(newMsgs, output)
 	lastSeq, err := a.store.AppendHistory(ctx, sessionID, newMsgs...)
 	if err != nil {
@@ -466,37 +490,14 @@ func (a *Agent) run(
 	// 游标指向本次追加的最后一条记录 seq（本 Turn 已全量消费历史）
 	state.UpdateFromTurn()
 	state.HistoryCursor = int(lastSeq)
+	state.HitlState = session.HitlState{Status: session.HitlIdle}
 	if err := a.store.SaveState(ctx, sessionID, state); err != nil {
 		return nil, fmt.Errorf("save state: %w", err)
 	}
-	if err := a.deleteCheckpoint(ctx, sessionID); err != nil {
-		return nil, err
-	}
+	a.discardCheckpoint(ctx, sessionID)
 
 	emitter.Emit(projection.TurnEnd, map[string]any{"content_length": len(output.Content)})
 	return output, nil
-}
-
-func (a *Agent) requireCheckpoint(ctx context.Context, sessionID string) error {
-	_, ok, err := a.checkpointStore.Get(ctx, sessionID)
-	if err != nil {
-		return fmt.Errorf("get checkpoint: %w", err)
-	}
-	if !ok {
-		return fmt.Errorf("%w: %s", ErrCheckpointNotFound, sessionID)
-	}
-	return nil
-}
-
-func (a *Agent) deleteCheckpoint(ctx context.Context, sessionID string) error {
-	deleter, ok := a.checkpointStore.(hitl.CheckPointDeleter)
-	if !ok {
-		return fmt.Errorf("checkpoint store %T does not support deletion", a.checkpointStore)
-	}
-	if err := deleter.Delete(ctx, sessionID); err != nil {
-		return fmt.Errorf("delete checkpoint: %w", err)
-	}
-	return nil
 }
 
 // execute 按模式执行图：同步走 Invoke；流式走 Stream 并读空输出流、

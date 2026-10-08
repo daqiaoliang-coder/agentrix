@@ -130,6 +130,13 @@ func NewEngineWithModel(m model.BaseChatModel) *Engine {
 	return e
 }
 
+// HasSummaryModel 返回是否已注入摘要模型。
+func (e *Engine) HasSummaryModel() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.summaryModel != nil
+}
+
 // SetOverhead 注入固定开销快照（工具 schema / 多模态预留）。
 // System Prompt 已在 messages 中计数。由装配层在确定 active toolset 后调用一次。
 func (e *Engine) SetOverhead(s PromptOverheadSnapshot) {

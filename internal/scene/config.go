@@ -18,6 +18,7 @@ type SceneConfig struct {
 	SystemPrompt       string                     // System Prompt
 	Model              model.ToolCallingChatModel // 模型实例
 	FallbackModel      model.ToolCallingChatModel // 降级模型（可选）：主模型重试耗尽后切到该模型再试一次
+	SummaryModel       model.BaseChatModel        // 摘要模型（可选）：压缩阶段③结构化摘要使用；nil 时降级为规则摘要
 	Tools              []tool.BaseTool            // 可用工具
 	MaxIterations      int                        // ReAct 最大循环次数
 	ModelContextWindow int                        // 模型上下文窗口；零值使用压缩引擎默认值

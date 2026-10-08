@@ -11,6 +11,7 @@ import (
 	"github.com/cloudwego/eino/schema"
 
 	ctxengine "github.com/daqiaoliang-coder/agentrix/internal/context"
+	"github.com/daqiaoliang-coder/agentrix/internal/harness/budget"
 	"github.com/daqiaoliang-coder/agentrix/internal/harness/hitl"
 	"github.com/daqiaoliang-coder/agentrix/internal/scene"
 	"github.com/daqiaoliang-coder/agentrix/internal/session"
@@ -436,8 +437,8 @@ func TestApprovalInterruptBlocksWriteUntilAuthorized(t *testing.T) {
 
 	_, err = agent2.Resume(ctx, "sess-approval", approval.InterruptID,
 		&hitl.ApprovalDecision{Approved: true, Operator: "planner"})
-	if !errors.Is(err, ErrCheckpointNotFound) {
-		t.Fatalf("重复 Resume 应返回 ErrCheckpointNotFound，实际: %v", err)
+	if !errors.Is(err, ErrNoPendingApproval) {
+		t.Fatalf("重复 Resume 应返回 ErrNoPendingApproval，实际: %v", err)
 	}
 	if writeTool.ran != 1 {
 		t.Errorf("重复 Resume 不得再次执行写工具，实际执行 %d 次", writeTool.ran)
@@ -688,6 +689,84 @@ func TestBudgetModelRejectsOversizedInputBeforeModelCall(t *testing.T) {
 	}
 }
 
+// TestBudgetModelStreamRejectsExhaustedBudget 验证 Stream 路径在预算耗尽时拒绝调用。
+func TestBudgetModelStreamRejectsExhaustedBudget(t *testing.T) {
+	raw := &scriptModel{replies: []*schema.Message{schema.AssistantMessage("不应调用", nil)}}
+	decorated := NewBudgetModel(raw, BudgetModelConfig{})
+
+	b := budget.NewBudget(100, 10)
+	b.ConsumeTokens(budget.TokenUsage{TotalTokens: 101}) // 超过上限，触发耗尽
+	ctx := budget.WithBudget(context.Background(), b)
+
+	input := []*schema.Message{schema.UserMessage("hi")}
+	if _, err := decorated.Stream(ctx, input); !errors.Is(err, budget.ErrBudgetExhausted) {
+		t.Fatalf("Stream 错误 = %v，期望 ErrBudgetExhausted", err)
+	}
+	if raw.call != 0 {
+		t.Fatalf("预算耗尽后仍调用底层模型 %d 次", raw.call)
+	}
+}
+
+// TestBudgetModelStreamRecordsCompaction 验证 Stream 路径压缩后向 Budget 记账。
+func TestBudgetModelStreamRecordsCompaction(t *testing.T) {
+	engine := ctxengine.NewEngine()
+	engine.ModelContextWindow = 2000 // softLimit=1600
+	engine.SetSpillStore(ctxengine.NewMemorySpillStore())
+
+	raw := &scriptModel{replies: []*schema.Message{schema.AssistantMessage("ok", nil)}}
+	decorated := NewBudgetModel(raw, BudgetModelConfig{Engine: engine})
+
+	b := budget.NewBudget(100000, 100)
+	ctx := budget.WithBudget(context.Background(), b)
+
+	// 构造工具调用结果（可被压缩的内容）
+	input := []*schema.Message{
+		schema.UserMessage("start"),
+		&schema.Message{
+			Role: schema.Assistant,
+			ToolCalls: []schema.ToolCall{{
+				ID:       "call_1",
+				Function: schema.FunctionCall{Name: "search"},
+			}},
+		},
+		func() *schema.Message {
+			m := schema.ToolMessage(strings.Repeat("result1", 500), "call_1")
+			m.ToolName = "search"
+			return m
+		}(),
+		&schema.Message{
+			Role: schema.Assistant,
+			ToolCalls: []schema.ToolCall{{
+				ID:       "call_2",
+				Function: schema.FunctionCall{Name: "search"},
+			}},
+		},
+		func() *schema.Message {
+			m := schema.ToolMessage(strings.Repeat("result2", 500), "call_2")
+			m.ToolName = "search"
+			return m
+		}(),
+		schema.UserMessage("continue"),
+	}
+
+	sr, err := decorated.Stream(ctx, input)
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	// 消费流以完成调用
+	for {
+		_, recvErr := sr.Recv()
+		if recvErr != nil {
+			break
+		}
+	}
+	sr.Close()
+
+	if b.CompressEvents == 0 {
+		t.Error("Stream 路径压缩后未向 Budget 记账")
+	}
+}
+
 // TestNewAgentWithoutCatalogStillRegistersReadResult 验证无 Catalog 场景
 // （向后兼容路径）依然接入溢出存储与回读工具，只是不做非幂等区分。
 func TestNewAgentWithoutCatalogStillRegistersReadResult(t *testing.T) {
@@ -708,5 +787,41 @@ func TestNewAgentWithoutCatalogStillRegistersReadResult(t *testing.T) {
 	// 未接线非幂等判定时，engine 应退化为「全部可淘汰」而非 panic
 	if agent.engine.IsNonIdempotent != nil {
 		t.Error("无 Catalog 时不应设置非幂等判定")
+	}
+}
+
+// TestNewAgentInjectsSummaryModel 验证 SummaryModel 注入后引擎启用 LLM 摘要路径。
+func TestNewAgentInjectsSummaryModel(t *testing.T) {
+	ctx := context.Background()
+	summaryModel := &scriptModel{}
+
+	agent, err := NewAgent(ctx, &scene.SceneConfig{
+		Key:          "with_summary",
+		Model:        &scriptModel{},
+		SummaryModel: summaryModel,
+	}, session.NewMemoryStore())
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+
+	if !agent.engine.HasSummaryModel() {
+		t.Error("SummaryModel 已提供但引擎未注入，LLM 摘要路径不会启用")
+	}
+}
+
+// TestNewAgentWithoutSummaryModelFallsBackToRule 验证未提供 SummaryModel 时
+// 引擎降级为规则摘要（HasSummaryModel 返回 false）。
+func TestNewAgentWithoutSummaryModelFallsBackToRule(t *testing.T) {
+	ctx := context.Background()
+	agent, err := NewAgent(ctx, &scene.SceneConfig{
+		Key:   "without_summary",
+		Model: &scriptModel{},
+	}, session.NewMemoryStore())
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+
+	if agent.engine.HasSummaryModel() {
+		t.Error("未提供 SummaryModel 但引擎报告已注入")
 	}
 }

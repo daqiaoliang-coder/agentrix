@@ -179,23 +179,62 @@ func (m *BudgetModel) callWithTimeout(
 
 // Stream 实现 model.BaseChatModel.Stream。
 //
-// 简化策略：仅做输入压缩与直通委托，不对流式调用施加单次超时，也不重试。
+// 治理对齐：与 Generate 路径一致，执行预算检查、无进展 nudge、压缩记账。
+// 但不对流式调用施加单次超时，也不重试。
 // 原因：Stream 返回 StreamReader 后才被消费，若在此 defer cancel 会立即切断 reader；
 // 而 leak cancel 又有资源风险。流式超时改由 Agent.Run 的外层 TotalTimeout 经 ctx
 // 传播兜底，重试语义（需重放已消费的 reader）留作后续增强。
+//
+// 用量与签名记录：Stream 路径不在此处记录 usage/progress，因为 StreamReader
+// 的消费发生在调用方（eino 的 ReAct 循环），此处无法拦截消费时机。遥测层
+// （observe.go 的 onEndStream）已负责流式帧的拼接与 llm_end 信号，Budget
+// 的 usage 记录依赖真实模型返回的 ResponseMeta.Usage，仅在 Generate 路径执行。
 func (m *BudgetModel) Stream(
 	ctx context.Context,
 	input []*schema.Message,
 	opts ...model.Option,
 ) (*schema.StreamReader[*schema.Message], error) {
 
-	if m.cfg.Engine != nil {
-		var err error
-		input, err = m.cfg.Engine.CompressInPlace(ctx, input)
-		if err != nil {
+	// ① 预算短路检查
+	b, hasBudget := budget.FromContext(ctx)
+	if hasBudget {
+		if b.IsExhausted() {
+			return nil, fmt.Errorf("budget exhausted before stream call: %w", budget.ErrBudgetExhausted)
+		}
+		if err := b.CheckDeadline(); err != nil {
 			return nil, err
 		}
 	}
+
+	// ② 无进展检测：注入收尾提示
+	if hasBudget && m.cfg.NoProgressLimit > 0 && b.IsStagnant(m.cfg.NoProgressLimit) {
+		nudge := schema.SystemMessage(
+			fmt.Sprintf(
+				"你已连续 %d 轮没有产生新的工具调用或新信息，请基于现有信息总结并给出最终回答。",
+				m.cfg.NoProgressLimit,
+			),
+		)
+		input = append(append([]*schema.Message(nil), input...), nudge)
+	}
+
+	// ③ 上下文压缩 + 记账
+	if m.cfg.Engine != nil {
+		var stats ctxengine.CompressStats
+		var compressErr error
+		input, stats, compressErr = m.cfg.Engine.CompressInPlaceWithStats(ctx, input)
+		if compressErr != nil {
+			return nil, compressErr
+		}
+		if hasBudget && stats.Triggered {
+			b.RecordCompaction(
+				stats.TokensSaved(),
+				stats.NetTokensSaved(),
+				stats.SummaryTokens,
+				stats.UnrecoverableLost,
+			)
+		}
+	}
+
 	return m.raw.Stream(ctx, input, opts...)
 }
 
