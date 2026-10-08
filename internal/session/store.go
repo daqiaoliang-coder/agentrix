@@ -38,6 +38,7 @@ type Store interface {
 // MemoryStore 内存实现（生产环境可替换为 MySQL/Redis）。
 // RawHistory 以 RawHistoryRecord 存放，写入时统一分配 id/seq/create_time。
 type MemoryStore struct {
+	*MemoryLeaser
 	mu      sync.RWMutex
 	states  map[string]*State
 	records map[string][]RawHistoryRecord
@@ -46,8 +47,9 @@ type MemoryStore struct {
 
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
-		states:  make(map[string]*State),
-		records: make(map[string][]RawHistoryRecord),
+		MemoryLeaser: NewMemoryLeaser(),
+		states:       make(map[string]*State),
+		records:      make(map[string][]RawHistoryRecord),
 	}
 }
 

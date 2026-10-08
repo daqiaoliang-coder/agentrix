@@ -62,6 +62,9 @@ func setupTelemetry() {
 // MySQL 模式下同时把检查点存储切换为持久化实现：审批中断的现场落库，
 // 进程重启或多副本部署后 Resume 仍能恢复；未设置 DSN 时保持进程内
 // 默认（hitl.DefaultCheckPointStore 的内存回退）。
+//
+// 会话执行租约由 Store 自身提供（MySQLStore 依赖 ai_session_lease，
+// 见 migrations/003_session_lease.sql），多副本下 Run/Resume 同会话互斥。
 func buildStore() session.Store {
 	dsn := os.Getenv("AGENTRIX_MYSQL_DSN")
 	if dsn == "" {

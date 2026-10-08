@@ -30,10 +30,11 @@ func init() {
 
 // ApprovalRequest 是中断时传给外部系统的信息
 type ApprovalRequest struct {
-	ToolName  string    `json:"tool_name"`
-	Arguments string    `json:"arguments"`
-	Reason    string    `json:"reason"`
-	Timestamp time.Time `json:"timestamp"`
+	ToolName   string    `json:"tool_name"`
+	ToolCallID string    `json:"tool_call_id,omitempty"`
+	Arguments  string    `json:"arguments"`
+	Reason     string    `json:"reason"`
+	Timestamp  time.Time `json:"timestamp"`
 }
 
 // ApprovalDecision 是人工审批的决策结果
@@ -62,14 +63,17 @@ type ApprovalState struct {
 //	    return t.doWrite(ctx, args)
 //	}
 func RequestApproval(ctx context.Context, toolName, args, reason string) error {
+	callID := compose.GetToolCallID(ctx)
 	req := &ApprovalRequest{
-		ToolName:  toolName,
-		Arguments: args,
-		Reason:    reason,
-		Timestamp: time.Now(),
+		ToolName:   toolName,
+		ToolCallID: callID,
+		Arguments:  args,
+		Reason:     reason,
+		Timestamp:  time.Now(),
 	}
 	state := &ApprovalState{
-		ToolName: toolName,
+		PendingToolCallID: callID,
+		ToolName:          toolName,
 	}
 	// StatefulInterrupt 同时保存 info 和组件内部 state
 	return compose.StatefulInterrupt(ctx, req, state)

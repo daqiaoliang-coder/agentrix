@@ -136,9 +136,11 @@ type ToolCallSnapshot struct {
 
 // HitlState 记录 HITL 中断/恢复的运行时状态。
 // 正常轮次为 IDLE；触发审批中断后置为 SUSPENDED 并保存挂起调用快照；
-// 恢复流程中短暂为 RESUMING。
+// Resume 认领后置为 RESUMING，直到 Turn 成功才回到 IDLE。RESUMING 期间失败
+// 不会退回 SUSPENDED：写工具可能已执行，重放会重复写（at-most-once）。
 type HitlState struct {
 	Status            HitlStatus        `json:"status"`                        // IDLE / SUSPENDED / RESUMING
+	InterruptID       string            `json:"interrupt_id,omitempty"`        // 挂起中断点 ID，Resume 须原样匹配
 	SuspendedToolCall *ToolCallSnapshot `json:"suspended_tool_call,omitempty"` // 挂起时的工具调用
 	BudgetConsumed    int               `json:"budget_consumed"`               // 挂起时已消耗的预算
 }

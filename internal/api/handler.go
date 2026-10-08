@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -71,12 +72,25 @@ var (
 	errResumeParams  = fmt.Errorf("resume requires interrupt_id and decision")
 )
 
+// statusOf 把执行错误映射为 HTTP 状态码：
+//   - 409：会话正被执行、审批已被认领、interrupt_id 不匹配、状态 CAS 冲突——
+//     客户端应刷新会话状态后决定是否重试；
+//   - 410：审批已终结或已放弃（检查点不存在）——不可再恢复，应发起新 Turn。
 func statusOf(err error) int {
-	switch err {
-	case errSceneNotFound:
+	switch {
+	case errors.Is(err, errSceneNotFound):
 		return http.StatusNotFound
-	case errResumeParams:
+	case errors.Is(err, errResumeParams):
 		return http.StatusBadRequest
+	case errors.Is(err, core.ErrSessionBusy),
+		errors.Is(err, core.ErrSessionLeaseLost),
+		errors.Is(err, core.ErrResumeInProgress),
+		errors.Is(err, core.ErrInterruptMismatch),
+		errors.Is(err, session.ErrCASConflict):
+		return http.StatusConflict
+	case errors.Is(err, core.ErrNoPendingApproval),
+		errors.Is(err, core.ErrCheckpointNotFound):
+		return http.StatusGone
 	default:
 		return http.StatusInternalServerError
 	}

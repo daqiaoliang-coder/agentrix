@@ -141,7 +141,7 @@ func (t *subagentTool) InvokableRun(
 		engine:          t.engine,
 		assembled:       t.assembled,
 	}
-	out, err := child.run(ctx, childSession, args.Task, false, nil)
+	out, err := child.run(ctx, childSession, args.Task, nil, nil)
 	if err != nil {
 		return "", fmt.Errorf("%s: %w", t.name, err)
 	}
