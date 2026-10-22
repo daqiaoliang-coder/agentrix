@@ -9,11 +9,11 @@ import (
 
 	"github.com/cloudwego/eino-ext/components/model/openai"
 
-	"github.com/daqiaoliang-coder/agentrix/internal/harness/core"
-	"github.com/daqiaoliang-coder/agentrix/internal/scene"
-	"github.com/daqiaoliang-coder/agentrix/internal/session"
-	"github.com/daqiaoliang-coder/agentrix/internal/tool"
-	"github.com/daqiaoliang-coder/agentrix/internal/tool/builtin"
+	"github.com/daqiaoliang-coder/agentrix/pkg/harness/core"
+	"github.com/daqiaoliang-coder/agentrix/pkg/scene"
+	"github.com/daqiaoliang-coder/agentrix/pkg/session"
+	"github.com/daqiaoliang-coder/agentrix/pkg/tool"
+	"github.com/daqiaoliang-coder/agentrix/pkg/tool/builtin"
 )
 
 func main() {

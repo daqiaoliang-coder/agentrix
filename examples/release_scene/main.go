@@ -31,12 +31,12 @@ import (
 	einotool "github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
 
-	"github.com/daqiaoliang-coder/agentrix/internal/harness/core"
-	"github.com/daqiaoliang-coder/agentrix/internal/harness/hitl"
-	"github.com/daqiaoliang-coder/agentrix/internal/scene"
-	"github.com/daqiaoliang-coder/agentrix/internal/session"
-	"github.com/daqiaoliang-coder/agentrix/internal/skill"
-	agenttool "github.com/daqiaoliang-coder/agentrix/internal/tool"
+	"github.com/daqiaoliang-coder/agentrix/pkg/harness/core"
+	"github.com/daqiaoliang-coder/agentrix/pkg/harness/hitl"
+	"github.com/daqiaoliang-coder/agentrix/pkg/scene"
+	"github.com/daqiaoliang-coder/agentrix/pkg/session"
+	"github.com/daqiaoliang-coder/agentrix/pkg/skill"
+	agenttool "github.com/daqiaoliang-coder/agentrix/pkg/tool"
 )
 
 // ── 业务工具：实际项目中由 RPC 客户端实现，此处用占位实现演示链路 ──

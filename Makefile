@@ -8,7 +8,10 @@
 ARK_MODEL ?= doubao-seed-2-0-mini-260428
 KEYCHAIN_SERVICE ?= harness-doubao-api-key
 
-.PHONY: run-echo build vet test tidy clean
+# 迁移目标使用的 DSN（默认读环境变量 AGENTRIX_MYSQL_DSN）
+MYSQL_DSN ?=
+
+.PHONY: run-echo build vet test tidy clean migrate
 
 run-echo: ## 运行 echo_scene 示例（Key 从 macOS Keychain 动态读取，不落盘）
 	ARK_API_KEY=$$(security find-generic-password -s "$(KEYCHAIN_SERVICE)" -w) \
@@ -29,3 +32,6 @@ tidy: ## 整理依赖
 
 clean: ## 清理构建缓存
 	go clean ./...
+
+migrate: ## 应用 migrations 下的 SQL（make migrate MYSQL_DSN=...）
+	go run ./cmd/migrate -dsn "$(MYSQL_DSN)" -dir ./migrations

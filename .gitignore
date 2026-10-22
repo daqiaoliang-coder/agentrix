@@ -4,6 +4,7 @@
 *.so
 *.dylib
 /agentrix
+/echo_scene
 *.test
 *.out
 /vendor/

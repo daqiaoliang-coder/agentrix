@@ -9,9 +9,9 @@ import (
 	einotool "github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
 
-	"github.com/daqiaoliang-coder/agentrix/internal/harness/core"
-	"github.com/daqiaoliang-coder/agentrix/internal/harness/hitl"
-	"github.com/daqiaoliang-coder/agentrix/internal/session"
+	"github.com/daqiaoliang-coder/agentrix/pkg/harness/core"
+	"github.com/daqiaoliang-coder/agentrix/pkg/harness/hitl"
+	"github.com/daqiaoliang-coder/agentrix/pkg/session"
 )
 
 // ── 脚本化假模型 ──
