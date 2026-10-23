@@ -56,8 +56,9 @@ type SceneConfig struct {
 	NoProgressLimit int
 
 	// ArtifactStore 是该场景的 artifact 存储（write_artifact / read_artifact 工具的后端）。
-	// nil 时回退为进程内 MemoryArtifactStore，且同一场景（按 Key）共享同一实例，
-	// 使 artifact 能跨轮、跨 Agent 实例累积；生产环境可替换为持久化实现。
+	// nil 时由 Registry 在注册阶段分配进程内 MemoryArtifactStore（按场景隔离）；
+	// 未经 Registry 直接构建的 Agent 则按实例分配，artifacts 不跨实例累积。
+	// 生产环境应注入持久化实现（LoaderDeps.ArtifactStore）。
 	ArtifactStore projection.ArtifactStore
 
 	// SpillStore 承接被上下文压缩淘汰的工具结果原文，供 read_result 回读。

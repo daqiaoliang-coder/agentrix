@@ -10,8 +10,16 @@ KEYCHAIN_SERVICE ?= harness-doubao-api-key
 
 # 迁移目标使用的 DSN（默认读环境变量 AGENTRIX_MYSQL_DSN）
 MYSQL_DSN ?=
+# 集成测试专用 DSN（指向可写的测试库）
+TEST_MYSQL_DSN ?=
 
-.PHONY: run-echo build vet test tidy clean migrate
+.PHONY: run-echo run-scene build vet test test-integration tidy clean migrate
+
+run-scene: ## 用 YAML 场景启动服务（需 ARK_API_KEY / ARK_MODEL）
+	AGENTRIX_SCENES_DIR=./examples/scenes go run ./cmd/agentrix
+
+test-integration: ## 运行 MySQL 集成测试（make test-integration TEST_MYSQL_DSN=...）
+	AGENTRIX_TEST_MYSQL_DSN="$(TEST_MYSQL_DSN)" go test -tags=integration ./... -v
 
 run-echo: ## 运行 echo_scene 示例（Key 从 macOS Keychain 动态读取，不落盘）
 	ARK_API_KEY=$$(security find-generic-password -s "$(KEYCHAIN_SERVICE)" -w) \

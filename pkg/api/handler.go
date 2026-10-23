@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,6 +28,7 @@ type Handler struct {
 	registry *scene.Registry
 	store    session.Store
 	auth     *identity.Authenticator
+	streams  *StreamTracker
 }
 
 // Option 覆盖 Handler 的默认依赖。
@@ -42,11 +44,18 @@ func NewHandler(registry *scene.Registry, store session.Store, opts ...Option) *
 		registry: registry,
 		store:    store,
 		auth:     identity.DevAuthenticator(),
+		streams:  NewStreamTracker(),
 	}
 	for _, opt := range opts {
 		opt(h)
 	}
 	return h
+}
+
+// DrainStreams 取消全部在途 SSE 流并拒绝新流。由 cmd 在优雅下线
+// 宽限期结束后调用；可重复调用。
+func (h *Handler) DrainStreams() {
+	h.streams.Drain()
 }
 
 // chatRequest 是 /chat 与 /chat/stream 共用的请求体。
@@ -63,7 +72,7 @@ type chatRequest struct {
 // runTurn 按请求执行或恢复一个 Turn；sink 非 nil 时走流式变体推出过程信号。
 // 会话 ID 统一按认证主体加前缀，避免不同调用方互相读写对方会话。
 func (h *Handler) runTurn(
-	r *http.Request,
+	ctx context.Context,
 	p identity.Principal,
 	req *chatRequest,
 	sink func(projection.Signal),
@@ -72,7 +81,7 @@ func (h *Handler) runTurn(
 	if !ok {
 		return nil, errSceneNotFound
 	}
-	agent, err := core.NewAgent(r.Context(), cfg, h.store)
+	agent, err := core.NewAgent(ctx, cfg, h.store)
 	if err != nil {
 		return nil, err
 	}
@@ -84,14 +93,14 @@ func (h *Handler) runTurn(
 		// 操作者以认证身份为准，不信任请求体自报的 operator
 		req.Decision.Operator = p.Operator()
 		if sink != nil {
-			return agent.ResumeStream(r.Context(), sessionID, req.InterruptID, req.Decision, sink)
+			return agent.ResumeStream(ctx, sessionID, req.InterruptID, req.Decision, sink)
 		}
-		return agent.Resume(r.Context(), sessionID, req.InterruptID, req.Decision)
+		return agent.Resume(ctx, sessionID, req.InterruptID, req.Decision)
 	}
 	if sink != nil {
-		return agent.RunStream(r.Context(), sessionID, req.Input, sink)
+		return agent.RunStream(ctx, sessionID, req.Input, sink)
 	}
-	return agent.Run(r.Context(), sessionID, req.Input)
+	return agent.Run(ctx, sessionID, req.Input)
 }
 
 // errSceneNotFound / errResumeParams 用哨兵错误区分 4xx 与 5xx。
@@ -107,10 +116,11 @@ func decodeRequest(w http.ResponseWriter, r *http.Request, dst any) error {
 }
 
 // writeError 统一错误响应：4xx 透出具体原因便于调用方纠正；
-// 5xx 只回通用文案，详情进服务端日志，避免泄露内部实现。
-func writeError(w http.ResponseWriter, err error, status int) {
+// 5xx 只回通用文案，详情进服务端日志（带 request_id 便于串联），
+// 避免泄露内部实现。
+func writeError(ctx context.Context, w http.ResponseWriter, err error, status int) {
 	if status >= http.StatusInternalServerError {
-		log.Printf("[api] internal error (status %d): %v", status, err)
+		log.Printf("[api] internal error (status %d, request_id=%s): %v", status, RequestID(ctx), err)
 		http.Error(w, "internal server error", status)
 		return
 	}
@@ -118,9 +128,9 @@ func writeError(w http.ResponseWriter, err error, status int) {
 }
 
 // errorMessage 与 writeError 同口径，供 SSE 事件使用。
-func errorMessage(err error, status int) string {
+func errorMessage(ctx context.Context, err error, status int) string {
 	if status >= http.StatusInternalServerError {
-		log.Printf("[api] internal error (status %d): %v", status, err)
+		log.Printf("[api] internal error (status %d, request_id=%s): %v", status, RequestID(ctx), err)
 		return "internal server error"
 	}
 	return err.Error()
@@ -130,7 +140,7 @@ func errorMessage(err error, status int) string {
 func (h *Handler) authenticate(w http.ResponseWriter, r *http.Request) (identity.Principal, bool) {
 	p, err := h.auth.Authenticate(r)
 	if err != nil {
-		writeError(w, err, http.StatusUnauthorized)
+		writeError(r.Context(), w, err, http.StatusUnauthorized)
 		return identity.Principal{}, false
 	}
 	return p, true
@@ -179,11 +189,11 @@ func (h *Handler) Chat(w http.ResponseWriter, r *http.Request) {
 	}
 	var req chatRequest
 	if err := decodeRequest(w, r, &req); err != nil {
-		writeError(w, err, statusOfDecode(err))
+		writeError(r.Context(), w, err, statusOfDecode(err))
 		return
 	}
 
-	output, err := h.runTurn(r, p, &req, nil)
+	output, err := h.runTurn(r.Context(), p, &req, nil)
 	if err != nil {
 		// 审批中断不是失败：返回 202 + 待审批信息，由前端发起人工授权后恢复
 		if approval, isApproval := core.ExtractApprovalRequired(err); isApproval {
@@ -196,7 +206,7 @@ func (h *Handler) Chat(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		writeError(w, err, statusOf(err))
+		writeError(r.Context(), w, err, statusOf(err))
 		return
 	}
 
@@ -219,7 +229,7 @@ func (h *Handler) ChatStream(w http.ResponseWriter, r *http.Request) {
 	}
 	var req chatRequest
 	if err := decodeRequest(w, r, &req); err != nil {
-		writeError(w, err, statusOfDecode(err))
+		writeError(r.Context(), w, err, statusOfDecode(err))
 		return
 	}
 	flusher, ok := w.(http.Flusher)
@@ -227,6 +237,14 @@ func (h *Handler) ChatStream(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
+
+	// 登记在途流：优雅下线时经 ctx 取消，避免长连接把 Shutdown 拖到超时强断。
+	streamCtx, release, err := h.streams.Track(r.Context())
+	if err != nil {
+		writeError(r.Context(), w, err, http.StatusServiceUnavailable)
+		return
+	}
+	defer release()
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -247,7 +265,7 @@ func (h *Handler) ChatStream(w http.ResponseWriter, r *http.Request) {
 
 	sink := func(sig projection.Signal) { writeEvent("signal", sig) }
 
-	output, err := h.runTurn(r, p, &req, sink)
+	output, err := h.runTurn(streamCtx, p, &req, sink)
 	if err != nil {
 		if approval, isApproval := core.ExtractApprovalRequired(err); isApproval {
 			writeEvent("approval_required", map[string]any{
@@ -258,7 +276,7 @@ func (h *Handler) ChatStream(w http.ResponseWriter, r *http.Request) {
 		}
 		status := statusOf(err)
 		writeEvent("error", map[string]any{
-			"message": errorMessage(err, status),
+			"message": errorMessage(r.Context(), err, status),
 			"status":  status,
 		})
 		return
@@ -267,8 +285,10 @@ func (h *Handler) ChatStream(w http.ResponseWriter, r *http.Request) {
 }
 
 // Artifacts 处理 GET /sessions/{session}/artifacts：列举某会话产生的全部
-// artifact。artifact 按 SessionID 归属存储，会话与场景无映射关系，故跨
-// 所有已注册的默认存储汇总过滤。输出按创建时间排序，保证分页/ diff 稳定。
+// artifact。artifact 按 SessionID 归属，会话与场景无映射关系，故需跨
+// 已注册场景的后端汇总。枚举范围以 Registry 中的场景为边界（而非包级
+// 全局存储表），场景下线或未注册时其存储不会被无界持有。
+// 输出按创建时间排序，保证分页 / diff 稳定。
 func (h *Handler) Artifacts(w http.ResponseWriter, r *http.Request) {
 	p, ok := h.authenticate(w, r)
 	if !ok {
@@ -283,14 +303,18 @@ func (h *Handler) Artifacts(w http.ResponseWriter, r *http.Request) {
 	out := make([]*projection.Artifact, 0)
 	// 多个场景可能共享同一持久化存储实例，按指针去重避免重复枚举
 	seen := make(map[projection.ArtifactStore]struct{})
-	for _, s := range core.RegisteredArtifactStores() {
+	for _, cfg := range h.registry.List() {
+		s := cfg.ArtifactStore
+		if s == nil {
+			continue
+		}
 		if _, dup := seen[s]; dup {
 			continue
 		}
 		seen[s] = struct{}{}
 		arts, err := s.ListBySession(r.Context(), sessionID)
 		if err != nil {
-			log.Printf("[api] list artifacts for %s: %v", sessionID, err)
+			log.Printf("[api] list artifacts for %s (scene %s): %v", sessionID, cfg.Key, err)
 			continue
 		}
 		out = append(out, arts...)

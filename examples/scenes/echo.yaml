@@ -1,0 +1,19 @@
+key: echo
+name: 回声助手
+system_prompt_file: prompts/echo.md
+skills_dir: skills
+
+model:
+  provider: ark
+  # name 留空时回退环境变量 ARK_MODEL；部署时建议显式指定接入点
+  api_key_env: ARK_API_KEY
+
+max_iterations: 6
+model_context_window: 32768
+token_budget: 60000
+compress_threshold: 0.8
+no_progress_limit: 3
+
+total_timeout: 2m
+model_call_timeout: 30s
+tool_call_timeout: 20s

@@ -47,6 +47,7 @@ func newSubagentTool(
 	key string,
 	childCfg *scene.SceneConfig,
 	store session.Store,
+	parentArtifactStore projection.ArtifactStore,
 ) (*subagentTool, error) {
 	if childCfg == nil {
 		return nil, fmt.Errorf("subagent %q: nil scene config", key)
@@ -54,6 +55,13 @@ func newSubagentTool(
 	// 浅拷贝后置空 Subagents：阻断嵌套派生，且不改调用方持有的原配置
 	child := *childCfg
 	child.Subagents = nil
+	// 子场景未显式配置 artifact 后端时沿用父场景的存储实例。
+	// 子代理以 父会话::key 为独立会话，artifact 按 SessionID 归属，
+	// 因此复用实例不会让父会话看到子代理产物；反之若各自新建内存实例，
+	// 持久化模式下子代理产物将无法跨重启回读。
+	if child.ArtifactStore == nil {
+		child.ArtifactStore = parentArtifactStore
+	}
 
 	checkpointStore := hitl.DefaultCheckPointStore()
 	engine, assembled, r, err := buildRuntime(ctx, &child, nil, checkpointStore)

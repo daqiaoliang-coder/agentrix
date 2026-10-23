@@ -59,7 +59,7 @@ func NewAgent(
 
 	// 子代理工具：按 key 排序保证工具顺序稳定（map 遍历无序会让系统提示抖动）
 	for _, key := range sortedSubagentKeys(cfg.Subagents) {
-		st, err := newSubagentTool(ctx, key, cfg.Subagents[key], store)
+		st, err := newSubagentTool(ctx, key, cfg.Subagents[key], store, artifactStore)
 		if err != nil {
 			return nil, fmt.Errorf("build subagent %q: %w", key, err)
 		}
@@ -157,29 +157,17 @@ func buildRuntime(
 	return engine, assembled, r, nil
 }
 
-// artifactStores 按场景共享进程内 ArtifactStore：SceneConfig 未显式配置时，
-// 同一场景的多轮、多 Agent 实例共享同一存储，artifact 才能跨轮累积。
-var artifactStores sync.Map // sceneKey -> projection.ArtifactStore
-
+// resolveArtifactStore 决定单个 Agent 实例的 artifact 后端。
+//
+// 显式配置的 ArtifactStore（Loader 注入的 MySQL 实现或宿主共享实例）直接使用；
+// 未配置时按 Agent 实例分配进程内存储——不再按 sceneKey 维护包级全局表，
+// 避免已下线场景的存储被永久持有、以及同 key 不同租户场景互相污染。
+// 需要跨轮/跨实例持久化的场景必须显式注入存储（YAML 加载路径已默认注入）。
 func resolveArtifactStore(cfg *scene.SceneConfig) projection.ArtifactStore {
 	if cfg.ArtifactStore != nil {
-		// 显式存储也登记，使 API 层按会话列举 artifact 时能覆盖到
-		artifactStores.LoadOrStore(cfg.Key, cfg.ArtifactStore)
 		return cfg.ArtifactStore
 	}
-	actual, _ := artifactStores.LoadOrStore(cfg.Key, projection.NewMemoryArtifactStore())
-	return actual.(projection.ArtifactStore)
-}
-
-// RegisteredArtifactStores 返回所有已解析的默认 ArtifactStore 快照，
-// 供 API 层按会话列举 artifact（显式配置的 cfg.ArtifactStore 由调用方自管）。
-func RegisteredArtifactStores() []projection.ArtifactStore {
-	var out []projection.ArtifactStore
-	artifactStores.Range(func(_, v any) bool {
-		out = append(out, v.(projection.ArtifactStore))
-		return true
-	})
-	return out
+	return projection.NewMemoryArtifactStore()
 }
 
 // readResultMaxChars 是 read_result 单次回读的字符上限，防止一条超大结果回读后
