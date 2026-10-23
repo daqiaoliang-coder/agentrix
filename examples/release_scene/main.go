@@ -31,12 +31,12 @@ import (
 	einotool "github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
 
-	"github.com/daqiaoliang-coder/agentrix/internal/harness/core"
-	"github.com/daqiaoliang-coder/agentrix/internal/harness/hitl"
-	"github.com/daqiaoliang-coder/agentrix/internal/scene"
-	"github.com/daqiaoliang-coder/agentrix/internal/session"
-	"github.com/daqiaoliang-coder/agentrix/internal/skill"
-	agenttool "github.com/daqiaoliang-coder/agentrix/internal/tool"
+	"github.com/daqiaoliang-coder/agentrix/pkg/harness/core"
+	"github.com/daqiaoliang-coder/agentrix/pkg/harness/hitl"
+	"github.com/daqiaoliang-coder/agentrix/pkg/scene"
+	"github.com/daqiaoliang-coder/agentrix/pkg/session"
+	"github.com/daqiaoliang-coder/agentrix/pkg/skill"
+	agenttool "github.com/daqiaoliang-coder/agentrix/pkg/tool"
 )
 
 // ── 业务工具：实际项目中由 RPC 客户端实现，此处用占位实现演示链路 ──
@@ -343,16 +343,17 @@ func NewSceneConfig(m einomodel.ToolCallingChatModel, tools []einotool.BaseTool)
 		Name: "发布灰度管理",
 		SystemPrompt: "你是发布变更助手。处理任何具体操作前，" +
 			"必须先用 read_skill 读取技能入口文档，再读取对应细则文档，严格按细则执行。",
-		Model:            m,
-		Tools:            tools,
-		Skills:           buildSkills(),
-		Catalog:          buildCatalog(),
-		AllowedCommands:  AllowedCommands,
-		MaxIterations:    8,
-		TokenBudget:      16384,
-		TotalTimeout:     2 * time.Minute,
-		ModelCallTimeout: 20 * time.Second,
-		NoProgressLimit:  3,
+		Model:              m,
+		Tools:              tools,
+		Skills:             buildSkills(),
+		Catalog:            buildCatalog(),
+		AllowedCommands:    AllowedCommands,
+		MaxIterations:      8,
+		ModelContextWindow: 16384,
+		TokenBudget:        16384,
+		TotalTimeout:       2 * time.Minute,
+		ModelCallTimeout:   20 * time.Second,
+		NoProgressLimit:    3,
 	}
 }
 
