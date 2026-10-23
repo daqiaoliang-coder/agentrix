@@ -26,3 +26,34 @@ jobs:
 
       - name: Build
         run: go build ./...
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: agentrix_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Download modules
+        run: go mod download
+
+      # 真实 MySQL 上验证迁移幂等、会话 CAS/游标、artifact 与 spill 持久化
+      - name: Integration tests
+        env:
+          AGENTRIX_TEST_MYSQL_DSN: "root:root@tcp(127.0.0.1:3306)/agentrix_test?parseTime=true&loc=UTC"
+        run: go test -tags=integration ./pkg/session -v

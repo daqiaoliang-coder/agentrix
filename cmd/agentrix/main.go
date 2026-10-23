@@ -35,6 +35,10 @@ const (
 	idleTimeout       = 120 * time.Second
 	shutdownTimeout   = 30 * time.Second
 
+	// streamDrainGrace 是优雅下线的 SSE 宽限期：先让能在宽限期内完成的
+	// Turn 自然收尾，超时后才取消在途流，避免长连接把 Shutdown 拖到强断。
+	streamDrainGrace = 5 * time.Second
+
 	defaultScenesDir  = "./scenes"
 	defaultArkBaseURL = "https://ark.cn-beijing.volces.com/api/v3"
 )
@@ -99,8 +103,9 @@ func main() {
 	mux.HandleFunc("GET /readyz", handleReadyz(store))
 
 	srv := &http.Server{
-		Addr:    addr,
-		Handler: mux,
+		Addr: addr,
+		// 请求 ID 中间件须包住整个 mux，健康检查与业务端点统一带 X-Request-Id
+		Handler: api.RequestIDMiddleware(mux),
 		// 慢速请求头攻击防护；SSE 是长连接，WriteTimeout 必须保持 0，
 		// 否则长 Turn 会在固定时长后被强制断开。
 		ReadHeaderTimeout: readHeaderTimeout,
@@ -130,11 +135,16 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
-	// 先停止接收新请求并等待在途请求结束，再冲刷遥测数据
+	// 先停止接收新请求；宽限期后取消在途 SSE，使长连接不把 Shutdown 拖到超时。
+	// AfterFunc 在独立 goroutine 执行，Shutdown 返回后立即 Stop 并兜底 Drain。
+	drainTimer := time.AfterFunc(streamDrainGrace, handler.DrainStreams)
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("[server] graceful shutdown failed: %v", err)
 		_ = srv.Close()
 	}
+	drainTimer.Stop()
+	handler.DrainStreams()
+
 	if err := tel.Shutdown(shutdownCtx); err != nil {
 		log.Printf("[telemetry] shutdown failed: %v", err)
 	}
@@ -206,15 +216,22 @@ func buildStore() (session.Store, *sql.DB) {
 }
 
 // loadScenes 从 AGENTRIX_SCENES_DIR（默认 ./scenes）加载 YAML 场景。
-// 目录不存在视为「未配置场景」，服务仍可启动（健康检查可用）；
-// 文件内容错误则启动失败，避免带病上线。
+//
+// 校验策略：
+//   - 目录由环境变量显式指定却不存在 → 启动失败（部署配置错误不应静默降级为空服务）；
+//   - 使用默认目录且不存在 → 仅告警，保留零配置本地启动（健康检查可用）；
+//   - 目录内没有场景文件、或任一场景解析失败 → 启动失败。
 func loadScenes(registry *scene.Registry, loader *scene.Loader) {
-	dir := os.Getenv("AGENTRIX_SCENES_DIR")
+	dir, explicit := os.LookupEnv("AGENTRIX_SCENES_DIR")
 	if dir == "" {
 		dir = defaultScenesDir
+		explicit = false
 	}
 	if _, err := os.Stat(dir); err != nil {
 		if os.IsNotExist(err) {
+			if explicit {
+				log.Fatalf("[scene] AGENTRIX_SCENES_DIR=%s does not exist", dir)
+			}
 			log.Printf("[scene] scenes dir %s not found, no scenes registered", dir)
 			return
 		}
@@ -223,6 +240,9 @@ func loadScenes(registry *scene.Registry, loader *scene.Loader) {
 	cfgs, err := loader.LoadDir(context.Background(), dir)
 	if err != nil {
 		log.Fatalf("[scene] load scenes: %v", err)
+	}
+	if len(cfgs) == 0 {
+		log.Fatalf("[scene] no *.yaml scenes found in %s", dir)
 	}
 	for _, cfg := range cfgs {
 		registry.Register(cfg)

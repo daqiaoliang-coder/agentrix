@@ -60,11 +60,18 @@ func (l *Loader) LoadDir(ctx context.Context, dir string) ([]*SceneConfig, error
 	sort.Strings(files)
 
 	out := make([]*SceneConfig, 0, len(files))
+	// 场景 key 是路由与 artifact/会话归属的稳定标识，重复注册会静默覆盖，
+	// 必须在启动期拒绝。
+	origin := make(map[string]string, len(files))
 	for _, f := range files {
 		cfg, err := l.LoadFile(ctx, f)
 		if err != nil {
 			return nil, err
 		}
+		if prev, dup := origin[cfg.Key]; dup {
+			return nil, fmt.Errorf("duplicate scene key %q in %s and %s", cfg.Key, prev, f)
+		}
+		origin[cfg.Key] = f
 		out = append(out, cfg)
 	}
 	return out, nil

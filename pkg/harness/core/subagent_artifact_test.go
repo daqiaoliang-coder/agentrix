@@ -134,6 +134,40 @@ func TestSubagentNoNestedSpawn(t *testing.T) {
 	}
 }
 
+// TestSubagentArtifactStoreIsolation 验证子代理的 artifact 后端归属：
+// 子场景未配置时沿用父场景存储（持久化模式下产物可跨重启回读），
+// 显式配置时保持自己的存储，不被父场景覆盖。
+func TestSubagentArtifactStoreIsolation(t *testing.T) {
+	ctx := context.Background()
+	parentStore := projection.NewMemoryArtifactStore()
+	childOwn := projection.NewMemoryArtifactStore()
+
+	agent, err := NewAgent(ctx, &scene.SceneConfig{
+		Key: "parent-art", Model: &scriptModel{}, MaxIterations: 1,
+		ArtifactStore: parentStore,
+		Subagents: map[string]*scene.SceneConfig{
+			"inherit": {Key: "child-inherit", Model: &scriptModel{}, MaxIterations: 1},
+			"own":     {Key: "child-own", Model: &scriptModel{}, MaxIterations: 1, ArtifactStore: childOwn},
+		},
+	}, session.NewMemoryStore())
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+
+	got := make(map[string]projection.ArtifactStore)
+	for _, tl := range agent.assembled.Tools {
+		if st, ok := tl.(*subagentTool); ok {
+			got[st.key] = st.cfg.ArtifactStore
+		}
+	}
+	if got["inherit"] != parentStore {
+		t.Error("子代理未配置存储时应沿用父场景存储")
+	}
+	if got["own"] != childOwn {
+		t.Error("子场景显式配置的存储不应被父场景覆盖")
+	}
+}
+
 // ---------- artifact 工具与信号 ----------
 
 // writeArtifactCall 构造一次 write_artifact 工具调用消息。

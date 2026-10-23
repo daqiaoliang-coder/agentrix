@@ -137,3 +137,36 @@ func write(t *testing.T, path, content string) {
 		t.Fatal(err)
 	}
 }
+
+// TestExamplesScenesLoad 保证仓库交付的示例场景（examples/scenes）始终可被
+// 加载器解析：改了字段名或目录约定而没同步示例时，这里会失败。
+func TestExamplesScenesLoad(t *testing.T) {
+	dir := filepath.Join("..", "..", "examples", "scenes")
+	loader := NewLoader(LoaderDeps{
+		ModelFactory: func(_ context.Context, spec ModelSpec) (model.ToolCallingChatModel, error) {
+			return stubModel{name: spec.Name}, nil
+		},
+	})
+	cfgs, err := loader.LoadDir(context.Background(), dir)
+	if err != nil {
+		t.Fatalf("示例场景加载失败: %v", err)
+	}
+	if len(cfgs) == 0 {
+		t.Fatal("示例场景目录为空")
+	}
+	var echo *SceneConfig
+	for _, cfg := range cfgs {
+		if cfg.Key == "echo" {
+			echo = cfg
+		}
+	}
+	if echo == nil {
+		t.Fatalf("示例场景缺少 echo，实际 %d 个", len(cfgs))
+	}
+	if echo.Skills == nil || len(echo.Skills.Frontmatter()) == 0 {
+		t.Error("echo 场景应加载出技能索引")
+	}
+	if echo.TotalTimeout <= 0 || echo.ToolCallTimeout <= 0 {
+		t.Errorf("超时配置未生效: total=%v tool=%v", echo.TotalTimeout, echo.ToolCallTimeout)
+	}
+}
