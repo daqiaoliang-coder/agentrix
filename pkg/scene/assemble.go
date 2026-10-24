@@ -17,17 +17,19 @@ type AssembleResult struct {
 	Tools        []einotool.BaseTool
 }
 
-// Assemble 在 Agent 构建前完成三件事（均按配置开关生效，未配置时行为与旧版一致）：
+// Assemble 在 Agent 构建前完成四件事（均按配置开关生效，未配置时行为与旧版一致）：
 //
 //  1. Skill 接线（渐进式加载阶段 0）：把全部技能的 name+description 注入系统提示，
 //     并自动注册 read_skill 工具，让模型可自主触发阶段 1（读 SKILL.md）与阶段 2（读 reference）。
-//  2. 命令白名单过滤：cfg.Catalog 与 cfg.AllowedCommands 同时存在时，
-//     只保留命令在白名单内的业务工具；框架工具（read_skill 等）始终放行。
-//  3. 审批包装（HITL 触发点）：Catalog 中 NeedsApproval=true 的工具被套上
+//  2. 审批包装（HITL 触发点）：Catalog 中 NeedsApproval=true 的工具被套上
 //     ApprovalWrapper，写操作执行前触发人工授权中断。
+//  3. 参数级硬约束：命中 ParamPolicies 的调用在审批之前直接拒绝。
+//  4. 命令白名单过滤：cfg.Catalog 与 cfg.AllowedCommands 同时存在时，
+//     只保留命令在白名单内的业务工具；框架工具（read_skill 等）始终放行。
 //
-// 顺序很重要：先包装审批，再做白名单过滤——过滤基于 Info().Name，
-// 而 ApprovalWrapper 透传被包装工具的元信息，两步互不干扰。
+// 顺序很重要：参数策略必须包在审批包装之外（后包者在外层），命中硬约束的
+// 调用不应再询问人工；审批先于白名单过滤——过滤基于 Info().Name，
+// 各包装器均透传名称，互不干扰。
 func (c *SceneConfig) Assemble(ctx context.Context) (*AssembleResult, error) {
 	prompt := c.SystemPrompt
 	tools := make([]einotool.BaseTool, len(c.Tools))
@@ -63,7 +65,17 @@ func (c *SceneConfig) Assemble(ctx context.Context) (*AssembleResult, error) {
 		tools = wrapped
 	}
 
-	// ③ 命令白名单过滤
+	// ③ 参数级硬约束：必须包在审批之外——命中策略的调用不应先中断等人工，
+	// 而应在进入审批前直接拒绝。包装顺序上「后包者在外层」。
+	if len(c.ParamPolicies) > 0 {
+		wrapped, err := agenttool.WrapPolicies(ctx, tools, c.ParamPolicies)
+		if err != nil {
+			return nil, fmt.Errorf("assemble scene %s: %w", c.Key, err)
+		}
+		tools = wrapped
+	}
+
+	// ④ 命令白名单过滤
 	if c.Catalog != nil && len(c.AllowedCommands) > 0 {
 		filtered, err := c.Catalog.FilterTools(ctx, tools, c.AllowedCommands)
 		if err != nil {
@@ -72,7 +84,7 @@ func (c *SceneConfig) Assemble(ctx context.Context) (*AssembleResult, error) {
 		tools = filtered
 	}
 
-	// ④ 工具调用超时（最外层）：覆盖审批恢复后的实际执行
+	// ⑤ 工具调用超时（最外层）：覆盖审批恢复后的实际执行
 	if c.ToolCallTimeout > 0 {
 		timed, err := agenttool.WrapTimeouts(ctx, tools, c.ToolCallTimeout)
 		if err != nil {

@@ -35,6 +35,13 @@ make migrate MYSQL_DSN="$AGENTRIX_MYSQL_DSN"
 AGENTRIX_SCENES_DIR=./examples/scenes go run ./cmd/agentrix
 ```
 
+macOS 可将 DSN 存入 Keychain（服务名 `agentrix-mysql-dsn`，不落盘）：
+
+```bash
+make migrate            # 自动从 Keychain 读取 DSN
+make run-scene-mysql    # MySQL 存储 + YAML 场景启动
+```
+
 主要环境变量：
 
 | 变量 | 说明 |

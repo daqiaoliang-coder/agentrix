@@ -211,7 +211,9 @@ func buildStore() (session.Store, *sql.DB) {
 	}
 	// 与会话存储共享同一连接池，避免多份池开销
 	hitl.SetDefaultCheckPointStore(hitl.NewMySQLCheckPointStore(db))
-	log.Println("[store] using MySQL store (dual-track: raw_history + session_state; checkpoint: ai_checkpoint)")
+	// 审批审计独立于检查点：检查点成功后删除，审计需长期保留「谁批了什么」
+	hitl.SetDefaultApprovalAuditStore(hitl.NewMySQLApprovalAuditStore(db))
+	log.Println("[store] using MySQL store (dual-track: raw_history + session_state; checkpoint: ai_checkpoint; audit: ai_approval_audit)")
 	return session.NewMySQLStore(db), db
 }
 

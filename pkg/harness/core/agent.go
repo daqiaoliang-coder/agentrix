@@ -360,7 +360,7 @@ func (a *Agent) run(
 		return nil, fmt.Errorf("load state: %w", err)
 	}
 	if resuming {
-		if err := a.claimResume(ctx, sessionID, state, resume.interruptID); err != nil {
+		if err := a.claimResume(ctx, sessionID, state, resume.interruptID, resume.decision); err != nil {
 			return nil, err
 		}
 		ctx = hitl.ResumeWithDecision(ctx, resume.interruptID, resume.decision)
@@ -457,7 +457,7 @@ func (a *Agent) run(
 		// 审批中断也是运行事实：先落盘挂起状态，再让外层感知「正在等待人工授权」。
 		// 落盘失败按失败返回而非 202：工作记忆不是 SUSPENDED，该中断无法被恢复。
 		if approval, ok := ExtractApprovalRequired(err); ok {
-			if serr := a.suspend(ctx, sessionID, state, userInput, resuming, capture.snapshot(), approval); serr != nil {
+			if serr := a.suspend(ctx, sessionID, turnID, state, userInput, resuming, capture.snapshot(), approval); serr != nil {
 				return nil, serr
 			}
 			emitter.Emit(projection.ApproveRequested, approval.Request)

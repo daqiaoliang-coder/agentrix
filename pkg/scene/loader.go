@@ -131,6 +131,16 @@ func (l *Loader) LoadFile(ctx context.Context, path string) (*SceneConfig, error
 		toolTimeout = 60 * time.Second
 	}
 
+	// 参数级策略在启动期校验：操作符/必填项非法或指向未注册工具时拒绝启动，
+	// 避免带病配置在每次请求装配时才失败。
+	policies, err := agenttool.NormalizeParamRules(spec.ParamPolicies)
+	if err != nil {
+		return nil, fmt.Errorf("scene %s: %w", path, err)
+	}
+	if err := validatePolicyTools(ctx, policies, l.deps.Tools); err != nil {
+		return nil, fmt.Errorf("scene %s: %w", path, err)
+	}
+
 	cfg := &SceneConfig{
 		Key:                spec.Key,
 		Name:               spec.Name,
@@ -139,6 +149,7 @@ func (l *Loader) LoadFile(ctx context.Context, path string) (*SceneConfig, error
 		Tools:              l.deps.Tools,
 		Skills:             skills,
 		AllowedCommands:    spec.AllowedCommands,
+		ParamPolicies:      policies,
 		Catalog:            l.deps.Catalog,
 		MaxIterations:      spec.MaxIterations,
 		ModelContextWindow: spec.ModelContextWindow,
@@ -172,6 +183,31 @@ func validateSpec(spec *SceneSpec) error {
 	}
 	if spec.CompressThreshold < 0 || spec.CompressThreshold >= 1 {
 		return fmt.Errorf("compress_threshold must be in (0,1), got %v", spec.CompressThreshold)
+	}
+	return nil
+}
+
+// validatePolicyTools 确认参数策略只指向宿主已注册的业务工具。
+// 策略指向不存在的工具意味着配置错误——运行时才发现会让每个 Turn 失败。
+func validatePolicyTools(ctx context.Context, policies []agenttool.ParamRule, tools []einotool.BaseTool) error {
+	if len(policies) == 0 {
+		return nil
+	}
+	names := make(map[string]bool, len(tools))
+	for _, t := range tools {
+		if t == nil {
+			continue
+		}
+		info, err := t.Info(ctx)
+		if err != nil {
+			return fmt.Errorf("param_policies: read tool info: %w", err)
+		}
+		names[info.Name] = true
+	}
+	for _, r := range policies {
+		if !names[r.Tool] {
+			return fmt.Errorf("param_policies: tool %q is not registered", r.Tool)
+		}
 	}
 	return nil
 }

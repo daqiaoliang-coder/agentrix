@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/cloudwego/eino/components/model"
+	einotool "github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
 )
 
@@ -125,6 +126,77 @@ model:
 	}
 	if cfgs[0].ToolCallTimeout != 60*time.Second {
 		t.Errorf("tool_call_timeout 默认值 = %v，期望 60s", cfgs[0].ToolCallTimeout)
+	}
+}
+
+// stubTool 提供策略校验所需的工具名。
+type stubTool struct{ name string }
+
+func (t stubTool) Info(_ context.Context) (*schema.ToolInfo, error) {
+	return &schema.ToolInfo{Name: t.name}, nil
+}
+
+func (t stubTool) InvokableRun(_ context.Context, _ string, _ ...einotool.Option) (string, error) {
+	return "", nil
+}
+
+func TestLoaderParamPolicies(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "p.md"), "prompt")
+	write(t, filepath.Join(dir, "s.yaml"), `
+key: release
+system_prompt_file: p.md
+model:
+  name: m
+param_policies:
+  - tool: release
+    argument: ratio
+    operator: gt
+    value: 20
+    message: 单次灰度比例不得超过 20
+`)
+	loader := NewLoader(LoaderDeps{
+		ModelFactory: func(context.Context, ModelSpec) (model.ToolCallingChatModel, error) {
+			return stubModel{}, nil
+		},
+		Tools: []einotool.BaseTool{stubTool{name: "release"}},
+	})
+	cfgs, err := loader.LoadDir(context.Background(), dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(cfgs[0].ParamPolicies) != 1 {
+		t.Fatalf("param_policies 未解析: %+v", cfgs[0].ParamPolicies)
+	}
+	r := cfgs[0].ParamPolicies[0]
+	if r.Tool != "release" || r.Argument != "ratio" || r.Operator != "gt" || r.Message == "" {
+		t.Errorf("策略字段不正确: %+v", r)
+	}
+}
+
+func TestLoaderParamPoliciesRejectsUnknownTool(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "p.md"), "prompt")
+	write(t, filepath.Join(dir, "s.yaml"), `
+key: release
+system_prompt_file: p.md
+model:
+  name: m
+param_policies:
+  - tool: missing
+    argument: ratio
+    operator: gt
+    value: 20
+`)
+	loader := NewLoader(LoaderDeps{
+		ModelFactory: func(context.Context, ModelSpec) (model.ToolCallingChatModel, error) {
+			return stubModel{}, nil
+		},
+		Tools: []einotool.BaseTool{stubTool{name: "release"}},
+	})
+	_, err := loader.LoadDir(context.Background(), dir)
+	if err == nil || !strings.Contains(err.Error(), "not registered") {
+		t.Fatalf("策略指向未注册工具应拒绝加载，实际: %v", err)
 	}
 }
 
