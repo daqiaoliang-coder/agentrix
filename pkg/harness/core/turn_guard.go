@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/cloudwego/eino/schema"
@@ -130,9 +131,18 @@ func newLeaseOwner() (string, error) {
 }
 
 // claimResume 校验挂起审批并认领：SUSPENDED 且 interrupt_id 匹配、检查点存在时，
-// 置为 RESUMING 落库后才允许执行。MySQL 下 SaveState 的 CAS 是租约之外的第二道
-// 互斥：并发认领只有一方能成功。
-func (a *Agent) claimResume(ctx context.Context, sessionID string, state *session.State, interruptID string) error {
+// 先写审计决策，再置为 RESUMING 落库后才允许执行。MySQL 下 SaveState 的 CAS
+// 是租约之外的第二道互斥：并发认领只有一方能成功。
+//
+// 审计写入失败时拒绝恢复（fail-closed）：写操作一旦执行就无法撤销，
+// 「谁批准了它」必须留痕，不能在无审计的情况下放行。
+func (a *Agent) claimResume(
+	ctx context.Context,
+	sessionID string,
+	state *session.State,
+	interruptID string,
+	decision *hitl.ApprovalDecision,
+) error {
 	switch state.HitlState.Status {
 	case session.HitlSuspended:
 	case session.HitlResuming:
@@ -146,9 +156,32 @@ func (a *Agent) claimResume(ctx context.Context, sessionID string, state *sessio
 	if err := a.requireCheckpoint(ctx, sessionID); err != nil {
 		return err
 	}
+	if err := recordDecisionAudit(ctx, interruptID, decision); err != nil {
+		return err
+	}
 	state.HitlState.Status = session.HitlResuming
 	if err := a.store.SaveState(ctx, sessionID, state); err != nil {
 		return fmt.Errorf("claim resume: %w", err)
+	}
+	return nil
+}
+
+// recordDecisionAudit 落库审批决策。操作者以认证身份为准（API 层已覆盖请求体
+// 自报值）；未经认证的直接调用记为 unknown，避免伪造具名审批人。
+func recordDecisionAudit(ctx context.Context, interruptID string, decision *hitl.ApprovalDecision) error {
+	operator := ""
+	comment := ""
+	approved := false
+	if decision != nil {
+		operator = strings.TrimSpace(decision.Operator)
+		comment = decision.Comment
+		approved = decision.Approved
+	}
+	if operator == "" {
+		operator = "unknown"
+	}
+	if err := hitl.DefaultApprovalAuditStore().RecordDecision(ctx, interruptID, operator, comment, approved); err != nil {
+		return fmt.Errorf("record approval decision: %w", err)
 	}
 	return nil
 }
@@ -166,6 +199,13 @@ func (a *Agent) abandonPendingApproval(ctx context.Context, sessionID string, st
 	content := "[审批已放弃：用户发起了新一轮对话，该工具未执行]"
 	if status == session.HitlResuming {
 		content = "[审批恢复未完成：该工具可能已执行，结果未知，请先核实再继续操作]"
+	}
+	// 审计标记为尽力而为：放弃审批是用户主动转向新对话，不应因审计存储故障
+	// 阻断新 Turn；已产生的 pending 记录仍可由运维侧核对。
+	if status == session.HitlSuspended && state.HitlState.InterruptID != "" {
+		if err := hitl.DefaultApprovalAuditStore().MarkAbandoned(ctx, state.HitlState.InterruptID); err != nil {
+			log.Printf("[audit] mark approval %s abandoned: %v", state.HitlState.InterruptID, err)
+		}
 	}
 	history, err := a.store.LoadHistory(ctx, sessionID)
 	if err != nil {
@@ -221,12 +261,34 @@ func closeUnansweredToolCalls(history []*schema.Message, content string) []*sche
 func (a *Agent) suspend(
 	ctx context.Context,
 	sessionID string,
+	turnID string,
 	state *session.State,
 	userInput string,
 	resuming bool,
 	captured []*schema.Message,
 	approval *ErrApprovalRequired,
 ) error {
+	req := approval.Request
+
+	// 审计先于任何落盘：审计失败时本轮不产生「已挂起但查不到审批依据」的
+	// 半成品状态（不追加历史、不置 SUSPENDED），客户端拿到明确错误。
+	audit := &hitl.ApprovalAudit{
+		InterruptID: approval.InterruptID,
+		Scene:       a.cfg.Key,
+		SessionID:   sessionID,
+		TurnID:      turnID,
+		Status:      hitl.ApprovalPending,
+	}
+	if req != nil {
+		audit.ToolName = req.ToolName
+		audit.ToolCallID = req.ToolCallID
+		audit.Arguments = req.Arguments
+		audit.Reason = req.Reason
+	}
+	if err := hitl.DefaultApprovalAuditStore().RecordRequest(ctx, audit); err != nil {
+		return fmt.Errorf("record approval audit: %w", err)
+	}
+
 	var msgs []*schema.Message
 	if !resuming {
 		msgs = append(msgs, schema.UserMessage(userInput))
@@ -245,13 +307,14 @@ func (a *Agent) suspend(
 		Status:      session.HitlSuspended,
 		InterruptID: approval.InterruptID,
 	}
-	if req := approval.Request; req != nil {
+	if req != nil {
 		state.HitlState.SuspendedToolCall = &session.ToolCallSnapshot{
 			ToolName:  req.ToolName,
 			Arguments: req.Arguments,
 			CallID:    req.ToolCallID,
 		}
 	}
+
 	if err := a.store.SaveState(ctx, sessionID, state); err != nil {
 		return fmt.Errorf("save state on interrupt: %w", err)
 	}

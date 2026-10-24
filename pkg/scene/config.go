@@ -37,6 +37,11 @@ type SceneConfig struct {
 	// 空表示不过滤（向后兼容，Tools 全量可见）。
 	AllowedCommands []string
 
+	// ParamPolicies 是参数级硬约束：装配阶段为对应工具套上策略包装，
+	// 命中即返回拒绝说明给模型，不触发审批、不执行工具。
+	// 与 NeedsApproval 的区别：审批是「可以问人」，策略是「谁批都不行」。
+	ParamPolicies []agenttool.ParamRule
+
 	// Catalog 是命令目录（命令 → 工具映射 + 执行位置 + 审批标记）。
 	// 与 AllowedCommands 配合完成白名单过滤，并为 NeedsApproval 的工具套上审批包装。
 	// nil 表示不启用 Catalog 治理，Tools 原样透传（向后兼容）。

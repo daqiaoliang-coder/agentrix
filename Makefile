@@ -8,14 +8,22 @@
 ARK_MODEL ?= doubao-seed-2-0-mini-260428
 KEYCHAIN_SERVICE ?= harness-doubao-api-key
 
-# 迁移目标使用的 DSN（默认读环境变量 AGENTRIX_MYSQL_DSN）
+# MySQL DSN：优先显式传入；否则在 recipe 执行时从 Keychain 读取，
+# 避免 make -n 把密钥展开到终端。
+MYSQL_KEYCHAIN_SERVICE ?= agentrix-mysql-dsn
 MYSQL_DSN ?=
-# 集成测试专用 DSN（指向可写的测试库）
+# 集成测试专用 DSN（必须指向可写的独立测试库，避免误删业务表）
 TEST_MYSQL_DSN ?=
 
-.PHONY: run-echo run-scene build vet test test-integration tidy clean migrate
+.PHONY: run-echo run-scene run-scene-mysql build vet test test-integration tidy clean migrate
 
 run-scene: ## 用 YAML 场景启动服务（需 ARK_API_KEY / ARK_MODEL）
+	AGENTRIX_SCENES_DIR=./examples/scenes go run ./cmd/agentrix
+
+run-scene-mysql: ## 用 Keychain 中的 DSN 启动服务（MySQL 存储 + YAML 场景）
+	@dsn="$(MYSQL_DSN)"; \
+	if [ -z "$$dsn" ]; then dsn=$$(security find-generic-password -s "$(MYSQL_KEYCHAIN_SERVICE)" -w 2>/dev/null); fi; \
+	AGENTRIX_MYSQL_DSN="$$dsn" \
 	AGENTRIX_SCENES_DIR=./examples/scenes go run ./cmd/agentrix
 
 test-integration: ## 运行 MySQL 集成测试（make test-integration TEST_MYSQL_DSN=...）
@@ -41,5 +49,7 @@ tidy: ## 整理依赖
 clean: ## 清理构建缓存
 	go clean ./...
 
-migrate: ## 应用 migrations 下的 SQL（make migrate MYSQL_DSN=...）
-	go run ./cmd/migrate -dsn "$(MYSQL_DSN)" -dir ./migrations
+migrate: ## 应用 migrations 下的 SQL（默认读 Keychain DSN，可 make migrate MYSQL_DSN=...）
+	@dsn="$(MYSQL_DSN)"; \
+	if [ -z "$$dsn" ]; then dsn=$$(security find-generic-password -s "$(MYSQL_KEYCHAIN_SERVICE)" -w 2>/dev/null); fi; \
+	AGENTRIX_MYSQL_DSN="$$dsn" go run ./cmd/migrate -dir ./migrations
